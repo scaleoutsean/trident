@@ -21,7 +21,8 @@ spec:
       serviceAccount: trident-csi
       containers:
       - name: trident-main
-        image: netapp/trident:22.01.0-custom
+        # image: netapp/trident:22.01.0-custom
+        image: scaleoutsean/trident-arm64:v22.07.0
         ports:
         - containerPort: 8443
         - containerPort: 8001

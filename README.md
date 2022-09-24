@@ -31,9 +31,16 @@ You may use the binary (it's for ARM64!) from Releases or - on x86_64 - use the 
 
 As mentioned in Release Notes, it is recommended to use [custom deployment](https://docs.netapp.com/us-en/trident-2204/trident-get-started/kubernetes-customize-deploy-tridentctl.html) and remove ASUP (autosupport) from it.
 
-If you wish to install to the namespace `trident`, create the namespace and use YAML files from setup directory:
+If you wish to install to the namespace `trident`:
 
-- Go to `setup` directory and change Trident image location in lines with `image` or override them `--trident-image` in `tridentctl` (below)
-- From parent directory run (sudo) `tridentctl install -n trident --use-custom-yaml` (--trident-image) to deploy. You may need to use sudo depending on your environment
+- Create a new namespace such as `trident`
+- Edit two files in `setup` directory to change Trident image location (`image`) or use `--trident-image` to override the location from `tridentctl` (below)
+  - setup/trident-daemonset.yaml
+  - setup/trident-deployment.yaml
+  - Image locations in daemonset and deployment YAML were changed from the NetApp (x86_64) default to `scaleoutsean/trident-arm64:v22.07.0` (Docker Hub) for people who don't want to build their own
+- Run (sudo) `tridentctl install -n trident --use-custom-yaml` (--trident-image) to deploy Trident to the Trident namespace 
+  - You may need to use sudo depending on your environment
+  - If you hacked the YAML files there's no need to specify custom image location with `--trident-image`
 
+Users who use Helm, Trident Operator, etc. should check the official docs. I don't that stuff.
 
