@@ -42,9 +42,16 @@ See the Docker and other documentation for the details.
 
 ## Deploy with `tridentctl` 
 
-You may use the `tridentctl` binary (for ARM64!) from Releases, you can build your own and extract `tridentctl` from the container image, or - when deploying from x86_64 client - you can use the official `tridentctl` (x86_64) to deploy to ARM64 systems.
+There are several ways:
 
-As mentioned in Release Notes, it is recommended to use [custom deployment](https://docs.netapp.com/us-en/trident-2204/trident-get-started/kubernetes-customize-deploy-tridentctl.html) and remove ASUP (autosupport) from it. That's already been done for sample files in the `setup` directory.
+- use the `tridentctl` binary (for ARM64!) from Releases
+- build your own container and extract `tridentctl` from the container image
+- (when deploying from x86_64 client) use the official `tridentctl` (for x86_64) to deploy this Trident build to ARM64 systems (probably easiest choice for those who don't want to build from source). You'd need to download the official Trident Installer for x86_64 to get tridentctl (x86_64) or (if you want to build everything from the source) build Trident twice (once for ARM64, to create an ARM64 container, and once for AMD64, to create tridentctl (x86_64))
+  - For mixed clusters there's another variant, where Master nodes may be on x86_64 and Worker nodes on ARM64. If you want to deploy for this, it's easiest to deploy twice - first to x86_64 using the official image, and another time using ARM64 image to deploy to Workers. Both `setup` and `setup-experimental` are meant for ARM64, so I don't think you should attempt to use them for x86_64 deployments
+
+As mentioned in Release Notes, [custom deployment](https://docs.netapp.com/us-en/trident-2204/trident-get-started/kubernetes-customize-deploy-tridentctl.html) lets you customize installation - for example, ASUP (autosupport) can be stripped. That's already been done for sample files in the `setup` and `setup-experimental` directories.
+
+### v22.07.0 (ARM64)
 
 If you wish to install to the namespace `trident`:
 
@@ -59,4 +66,9 @@ If you wish to install to the namespace `trident`:
   - If you hacked the YAML files or want to use my Docker Hub containers there's no need to specify custom image location with `--trident-image`
 
 Users who use Helm, Trident Operator, etc. should check the official docs. I don't use that stuff.
+
+### Experiemental deployment 
+
+- One-off build, using upstream commits as of 2022/09/25
+- See README.md in `setup-experimental`. Basically just move `setup` directory somewhere, and move `setup-experimental` to `setup`. Then deploy with `./tridentctl`.
 
