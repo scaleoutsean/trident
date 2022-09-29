@@ -67,7 +67,7 @@ If you wish to install to the namespace `trident`:
 
 Users who use Helm, Trident Operator, etc. should check the official docs. I don't use that stuff.
 
-### Experiemental deployment 
+### Experimental deployment 
 
 - One-off build, using upstream commits as of 2022/09/25
 - See README.md in `setup-experimental`. Basically just move `setup` directory somewhere, and move `setup-experimental` to `setup`. Then deploy with `./tridentctl`.
