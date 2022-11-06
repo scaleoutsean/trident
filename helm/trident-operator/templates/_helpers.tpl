@@ -71,7 +71,7 @@ Trident operator image
 {{- else if .Values.imageRegistry }}
 {{- .Values.imageRegistry }}/trident-operator:{{ .Values.operatorImageTag | default .Chart.AppVersion }}
 {{- else }}
-{{- "" }}docker.io/netapp/trident-operator:{{ .Values.operatorImageTag | default .Chart.AppVersion }}
+{{- "" }}docker.io/scaleoutsean/trident-operator-arm64:{{ .Values.operatorImageTag | default .Chart.AppVersion }}
 {{- end }}
 {{- end }}
 
@@ -108,18 +108,6 @@ Trident SilenceAutosupport
 {{- end }}
 {{- end }}
 
-Trident AutoSupport image
-*/}}
-{{- define "trident.autosupportImage" -}}
-{{- if .Values.tridentAutosupportImage }}
-{{- .Values.tridentAutosupportImage }}
-{{- else if .Values.imageRegistry }}
-{{- .Values.imageRegistry }}/trident-autosupport:{{ .Values.tridentAutosupportImageTag | default .Chart.AppVersion | trunc 5}}
-{{- else }}
-{{- "" }}docker.io/netapp/trident-autosupport:{{ .Values.tridentAutosupportImageTag | default .Chart.AppVersion | trunc 5}}
-{{- end }}
-{{- end }}
-
 {{/*
 Trident log format
 */}}
@@ -151,6 +139,6 @@ Trident image
 {{- else if .Values.imageRegistry }}
 {{- .Values.imageRegistry }}/trident:{{ .Values.tridentImageTag | default .Chart.AppVersion }}
 {{- else }}
-{{- "" }}docker.io/netapp/trident:{{ .Values.tridentImageTag | default .Chart.AppVersion }}
+{{- "" }}docker.io/scaleoutsean/trident-arm64:{{ .Values.tridentImageTag | default .Chart.AppVersion }}
 {{- end }}
 {{- end }}
