@@ -5,14 +5,11 @@ It's recommended to first compare this repository vs. NetApp's and build it from
 tldr;
 
 ```sh
-wget https://github.com/scaleoutsean/trident/releases/download/v22.10.0-arm64/tridentctl -O tridentctl
-chmod +x tridentctl
 git clone https://github.com/scaleoutsean/trident -b v22.10.0-arm64
-cd trident
-mkdir bin # to save tridentctl
+cd trident; mkdir bin # to save tridentctl
 wget https://github.com/scaleoutsean/trident/releases/download/v22.10.0-arm64/tridentctl -O ./bin/tridentctl
 chmod +x ./bin/tridentctl
-# use a container from Docker Hub
+# use scaleoutsean's container from Docker Hub
 ./bin/tridentctl install -n trident --use-custom-yaml --trident-image docker.io/scaleoutsean/trident-arm64:v22.10.0
 ```
 
@@ -29,7 +26,7 @@ sudo GOOS=linux GOARCH=arm64 make trident_build
 See BUILD.md for other options. Then view your work:
 
 ```sh
-sudo docker images
+docker images
 ```
 
 Verify that Trident container has been built - you should see your Trident build, golang and an ARM64 base container:
@@ -47,9 +44,9 @@ See the Docker and other documentation for the details.
 
 ## Deploying Trident with `tridentctl` 
 
-There are several ways to do it
+There are several ways to do it:
 
-- use the `tridentctl` binary (for ARM64!) from Releases, which is the method for all-ARM64 clusters, explained at the top
+- use the `tridentctl` binary (for ARM64!) from Releases, which is the method for all-ARM64 clusters (explained at the top)
 - build your own container and extract `tridentctl` from the container image, then use tridentctl with self-built or my image (at the top)
 - when deploying from x86_64 client: use the official `tridentctl` (for x86_64) to deploy this Trident build to ARM64 systems. This is probably the easiest choice for those who don't want to build from source. You'd need to download the official Trident Installer for x86_64 to get tridentctl (x86_64) or (if you want to build everything from the source) build Trident twice (once for this ARM64 source, to create an ARM64 container, and once for AMD64, using the NetApp source for tridentctl (x86_64))
   - For mixed clusters there's another variant, where Master nodes may be x86_64 and Worker nodes are ARM64. If you want to deploy for this situation, it's probaly easiest to deploy twice - first to x86_64 nodes using the official image, and another time using ARM64 image to deploy to Workers. Files in `setup` are meant for ARM64 so I don't think you should attempt to use them for x86_64 deployments
