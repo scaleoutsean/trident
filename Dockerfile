@@ -1,4 +1,5 @@
-FROM gcr.io/distroless/static:f072ab8fd7e21912a30720928cce8ad562e82718
+# FROM gcr.io/distroless/static:f072ab8fd7e21912a30720928cce8ad562e82718
+FROM gcr.io/distroless/static:latest-arm64
 
 LABEL maintainers="The NetApp Trident Team" \
       app="trident.netapp.io" \

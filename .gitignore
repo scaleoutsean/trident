@@ -2,7 +2,7 @@
 # Project
 ###############################################################################
 
-bin/trident*
+bin/*
 trident-required-images.md
 coverage/**
 vendor/
