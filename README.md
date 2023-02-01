@@ -132,7 +132,7 @@ NAME   STATUS   ROLES                  AGE    VERSION
 k1     Ready    control-plane,master   129d   v1.24.4+k3s1
 ```
 
-Modified ./trident-installer/sample-input/backends-samples/solidfire/backend-solidfire.json configured it with a SolidFire storage account `k3s`:
+Modified ./trident-installer/sample-input/backends-samples/solidfire/backend-solidfire.json configured for a SolidFire storage account `k3s`:
 
 ```json
 {
