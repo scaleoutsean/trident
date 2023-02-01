@@ -6,3 +6,4 @@ spec:
   debug: false
   namespace: default
   silenceAutosupport: false
+  disableAuditLog: true

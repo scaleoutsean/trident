@@ -4,4 +4,4 @@ kind: Namespace
 metadata:
   labels:
     pod-security.kubernetes.io/enforce: privileged
-  name: trident
+  name: default

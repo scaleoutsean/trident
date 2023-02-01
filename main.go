@@ -22,12 +22,16 @@ import (
 	"github.com/netapp/trident/frontend"
 	"github.com/netapp/trident/frontend/crd"
 	"github.com/netapp/trident/frontend/csi"
-	"github.com/netapp/trident/frontend/csi/helpers"
-	k8shelper "github.com/netapp/trident/frontend/csi/helpers/kubernetes"
-	plainhelper "github.com/netapp/trident/frontend/csi/helpers/plain"
+	controllerhelpers "github.com/netapp/trident/frontend/csi/controller_helpers"
+	k8sctrlhelper "github.com/netapp/trident/frontend/csi/controller_helpers/kubernetes"
+	plainctrlhelper "github.com/netapp/trident/frontend/csi/controller_helpers/plain"
+	nodehelpers "github.com/netapp/trident/frontend/csi/node_helpers"
+	k8snodehelper "github.com/netapp/trident/frontend/csi/node_helpers/kubernetes"
+	plainnodehelper "github.com/netapp/trident/frontend/csi/node_helpers/plain"
 	"github.com/netapp/trident/frontend/docker"
 	"github.com/netapp/trident/frontend/metrics"
 	"github.com/netapp/trident/frontend/rest"
+	"github.com/netapp/trident/logger"
 	"github.com/netapp/trident/logging"
 	persistentstore "github.com/netapp/trident/persistent_store"
 	"github.com/netapp/trident/utils"
@@ -38,6 +42,7 @@ var (
 	debug     = flag.Bool("debug", false, "Enable debugging output")
 	logLevel  = flag.String("log_level", "info", "Logging level (debug, info, warn, error, fatal)")
 	logFormat = flag.String("log_format", "text", "Logging format (text, json)")
+	auditLog  = flag.Bool("disable_audit_log", true, "Disable the audit logger")
 
 	// Kubernetes
 	k8sAPIServer = flag.String("k8s_api_server", "", "Kubernetes API server "+
@@ -62,8 +67,8 @@ var (
 		fmt.Sprintf("CSI role to play: '%s' or '%s'", csi.CSIController, csi.CSINode))
 
 	csiUnsafeNodeDetach = flag.Bool("csi_unsafe_detach", false, "Prefer to detach successfully rather than safely")
-
-	nodePrep = flag.Bool("node_prep", true, "Attempt to install required packages on nodes.")
+	enableForceDetach   = new(bool)
+	nodePrep            = flag.Bool("node_prep", true, "Attempt to install required packages on nodes.")
 
 	// Persistence
 	useInMemory = flag.Bool("no_persistence", false, "Does not persist "+
@@ -95,6 +100,13 @@ var (
 	metricsAddress = flag.String("metrics_address", "", "Storage orchestrator metrics address")
 	metricsPort    = flag.String("metrics_port", "8001", "Storage orchestrator metrics port")
 	enableMetrics  = flag.Bool("metrics", false, "Enable metrics interface")
+
+	// iSCSI
+	iSCSISelfHealingInterval = flag.Duration("iscsi_self_healing_interval", config.IscsiSelfHealingInterval,
+		"Interval at which the iSCSI self-healing thread is invoked")
+	iSCSISelfHealingWaitTime = flag.Duration("iscsi_self_healing_wait_time",
+		config.ISCSISelfHealingWaitTime,
+		"Wait time after which iSCSI self-healing attempts to fix stale sessions")
 
 	storeClient  persistentstore.Client
 	enableDocker bool
@@ -230,6 +242,12 @@ func main() {
 	var txnMonitor bool
 
 	runtime.GOMAXPROCS(runtime.NumCPU())
+
+	// These features are only supported on Linux.
+	if runtime.GOOS == "linux" {
+		enableForceDetach = flag.Bool("enable_force_detach", false, "Enable force detach feature.")
+	}
+
 	flag.Parse()
 	preBootstrapFrontends := make([]frontend.Plugin, 0)
 	postBootstrapFrontends := make([]frontend.Plugin, 0)
@@ -259,6 +277,9 @@ func main() {
 		_, _ = fmt.Fprint(os.Stderr, err)
 		os.Exit(1)
 	}
+
+	// Initialize the audit logger.
+	logger.InitAuditLogger(*auditLog)
 
 	// Print all env variables
 	for _, element := range os.Environ() {
@@ -325,20 +346,35 @@ func main() {
 			log.Fatal("CSI is enabled but csi_node_name was not specified.")
 		}
 
-		var hybridFrontend frontend.Plugin
+		var hybridControllerFrontend frontend.Plugin
+		var hybridNodeFrontend frontend.Plugin
 		if *k8sAPIServer != "" || *k8sPod {
-			hybridFrontend, err = k8shelper.NewPlugin(orchestrator, *k8sAPIServer, *k8sConfigPath)
+			hybridControllerFrontend, err = k8sctrlhelper.NewHelper(orchestrator, *k8sAPIServer, *k8sConfigPath)
+			hybridNodeFrontend, err = k8snodehelper.NewHelper(orchestrator, *k8sConfigPath)
 		} else {
-			hybridFrontend = plainhelper.NewPlugin(orchestrator)
+			hybridControllerFrontend = plainctrlhelper.NewHelper(orchestrator)
+			hybridNodeFrontend = plainnodehelper.NewHelper(orchestrator)
 		}
 		if err != nil {
 			log.Fatalf("Unable to start the K8S hybrid frontend. %v", err)
 		}
-		orchestrator.AddFrontend(hybridFrontend)
-		postBootstrapFrontends = append(postBootstrapFrontends, hybridFrontend)
-		hybridPlugin, ok := hybridFrontend.(helpers.HybridPlugin)
+
+		if *csiRole == csi.CSIController || *csiRole == csi.CSIAllInOne {
+			orchestrator.AddFrontend(hybridControllerFrontend)
+			postBootstrapFrontends = append(postBootstrapFrontends, hybridControllerFrontend)
+		}
+		controllerHelper, ok := hybridControllerFrontend.(controllerhelpers.ControllerHelper)
 		if !ok {
-			log.Fatalf("%e", utils.TypeAssertionError("hybridFrontend.(helpers.HybridPlugin)"))
+			log.Fatalf("%v", utils.TypeAssertionError("hybridControllerFrontend.(controllerhelpers.ControllerHelper)"))
+		}
+
+		if *csiRole == csi.CSINode || *csiRole == csi.CSIAllInOne {
+			orchestrator.AddFrontend(hybridNodeFrontend)
+			postBootstrapFrontends = append(postBootstrapFrontends, hybridNodeFrontend)
+		}
+		nodeHelper, ok := hybridNodeFrontend.(nodehelpers.NodeHelper)
+		if !ok {
+			log.Fatalf("%v", utils.TypeAssertionError("hybridNodeFrontend.(nodehelpers.NodeHelper)"))
 		}
 
 		log.WithFields(log.Fields{
@@ -350,16 +386,18 @@ func main() {
 		switch *csiRole {
 		case csi.CSIController:
 			txnMonitor = true
-			csiFrontend, err = csi.NewControllerPlugin(*csiNodeName, *csiEndpoint, *aesKey, orchestrator, &hybridPlugin)
+			csiFrontend, err = csi.NewControllerPlugin(*csiNodeName, *csiEndpoint, *aesKey, orchestrator, &controllerHelper)
 		case csi.CSINode:
 			csiFrontend, err = csi.NewNodePlugin(*csiNodeName, *csiEndpoint, *httpsCACert, *httpsClientCert,
-				*httpsClientKey, *aesKey, orchestrator, *csiUnsafeNodeDetach)
+				*httpsClientKey, *aesKey, orchestrator, *csiUnsafeNodeDetach, &nodeHelper, *enableForceDetach,
+				*iSCSISelfHealingInterval, *iSCSISelfHealingWaitTime)
 			enableMutualTLS = false
 			handler = rest.NewNodeRouter(csiFrontend)
 		case csi.CSIAllInOne:
 			txnMonitor = true
 			csiFrontend, err = csi.NewAllInOnePlugin(*csiNodeName, *csiEndpoint, *httpsCACert, *httpsClientCert,
-				*httpsClientKey, *aesKey, orchestrator, &hybridPlugin, *csiUnsafeNodeDetach)
+				*httpsClientKey, *aesKey, orchestrator, &controllerHelper, &nodeHelper, *csiUnsafeNodeDetach,
+				*iSCSISelfHealingInterval, *iSCSISelfHealingWaitTime)
 		}
 		if err != nil {
 			log.Fatalf("Unable to start the CSI frontend. %v", err)
@@ -426,11 +464,17 @@ func main() {
 			log.Error(err)
 		}
 	}
+
 	if err = orchestrator.Bootstrap(txnMonitor); err != nil {
 		log.Error(err.Error())
 	}
 	for _, f := range postBootstrapFrontends {
 		if err := f.Activate(); err != nil {
+			// If there is a terminal error during reconciliation, then the node plugin needs to be restarted so that we
+			// can try again.
+			if csi.IsTerminalReconciliationError(err) {
+				log.Fatal(err)
+			}
 			log.Error(err)
 		}
 	}

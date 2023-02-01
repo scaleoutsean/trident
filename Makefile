@@ -1,7 +1,7 @@
 # Copyright 2018 NetApp, Inc. All Rights Reserved.
 
 
-GOARCH ?= amd64
+GOARCH ?= arm64
 GOGC ?= ""
 GOPROXY ?= https://proxy.golang.org
 GO_IMAGE ?= golang:1.18

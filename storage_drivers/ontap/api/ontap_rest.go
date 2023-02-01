@@ -794,10 +794,6 @@ func (c RestClient) modifyVolumeUnixPermissionsByNameAndStyle(
 	ctx context.Context,
 	volumeName, unixPermissions, style string,
 ) error {
-	if unixPermissions == "" {
-		return fmt.Errorf("missing new unix permissions value")
-	}
-
 	volume, err := c.getVolumeByNameAndStyle(ctx, volumeName, style)
 	if err != nil {
 		return err
@@ -815,14 +811,17 @@ func (c RestClient) modifyVolumeUnixPermissionsByNameAndStyle(
 
 	// handle NAS options
 	volumeNas := &models.VolumeNas{}
-	unixPermissions = convertUnixPermissions(unixPermissions)
-	volumePermissions, parseErr := strconv.ParseInt(unixPermissions, 10, 64)
-	if parseErr != nil {
-		return fmt.Errorf("cannot process unix permissions value %v", unixPermissions)
-	}
-	volumeNas.UnixPermissions = volumePermissions
-
 	volumeInfo := &models.Volume{}
+
+	if unixPermissions != "" {
+		unixPermissions = convertUnixPermissions(unixPermissions)
+		volumePermissions, parseErr := strconv.ParseInt(unixPermissions, 10, 64)
+		if parseErr != nil {
+			return fmt.Errorf("cannot process unix permissions value %v", unixPermissions)
+		}
+		volumeNas.UnixPermissions = volumePermissions
+	}
+
 	volumeInfo.Nas = volumeNas
 	params.SetInfo(volumeInfo)
 
@@ -1846,7 +1845,9 @@ func (c RestClient) IgroupDestroy(ctx context.Context, initiatorGroupName string
 		return err
 	}
 	if igroup == nil {
-		return fmt.Errorf("unexpected response from igroup lookup, igroup was nil")
+		// Initiator group not found. Log a message and return nil.
+		Logc(ctx).WithField("igroup", initiatorGroupName).Debug("No such initiator group (igroup).")
+		return nil
 	}
 	igroupUUID := igroup.UUID
 
@@ -2771,7 +2772,7 @@ func (c RestClient) NetInterfaceGetDataLIFs(ctx context.Context, protocol string
 
 	dataLIFs := make([]string, 0)
 	for _, record := range lifResponse.Payload.Records {
-		if record.IP != nil {
+		if record.IP != nil && record.State == models.IPInterfaceStateUp {
 			dataLIFs = append(dataLIFs, string(record.IP.Address))
 		}
 	}
@@ -3655,8 +3656,35 @@ func (c RestClient) FlexgroupSetQosPolicyGroupName(
 
 // FlexGroupVolumeDisableSnapshotDirectoryAccess disables access to the ".snapshot" directory
 // Disable '.snapshot' to allow official mysql container's chmod-in-init to work
-func (c RestClient) FlexGroupVolumeDisableSnapshotDirectoryAccess(ctx context.Context, name string) error {
-	return c.VolumeDisableSnapshotDirectoryAccess(ctx, name)
+func (c RestClient) FlexGroupVolumeDisableSnapshotDirectoryAccess(ctx context.Context, flexGroupVolumeName string) error {
+	volume, err := c.getVolumeByNameAndStyle(ctx, flexGroupVolumeName, models.VolumeStyleFlexgroup)
+	if err != nil {
+		return err
+	}
+	if volume == nil {
+		return fmt.Errorf("could not find flexgroup volume with name %v", flexGroupVolumeName)
+	}
+
+	uuid := volume.UUID
+
+	params := storage.NewVolumeModifyParamsWithTimeout(c.httpClient.Timeout)
+	params.Context = ctx
+	params.HTTPClient = c.httpClient
+	params.UUIDPathParameter = uuid
+
+	volumeInfo := &models.Volume{}
+	volumeInfo.SnapshotDirectoryAccessEnabled = ToBoolPointer(false)
+	params.SetInfo(volumeInfo)
+
+	volumeModifyAccepted, err := c.api.Storage.VolumeModify(params, c.authInfo)
+	if err != nil {
+		return err
+	}
+	if volumeModifyAccepted == nil {
+		return fmt.Errorf("unexpected response from volume modify")
+	}
+
+	return c.PollJobStatus(ctx, volumeModifyAccepted.Payload)
 }
 
 func (c RestClient) FlexGroupModifyUnixPermissions(ctx context.Context, volumeName, unixPermissions string) error {
@@ -3999,12 +4027,7 @@ func (c RestClient) QtreeCount(ctx context.Context, volumeName string) (int, err
 }
 
 // QtreeExists returns true if the named Qtree exists (and is unique in the matching Flexvols)
-func (c RestClient) QtreeExists(ctx context.Context, name, volumePrefix string) (bool, string, error) {
-	volumePattern := "*"
-	if volumePrefix != "" {
-		volumePattern = volumePrefix + "*"
-	}
-
+func (c RestClient) QtreeExists(ctx context.Context, name, volumePattern string) (bool, string, error) {
 	// Limit the qtrees to those matching the Flexvol and Qtree name prefixes
 	params := storage.NewQtreeCollectionGetParamsWithTimeout(c.httpClient.Timeout)
 	params.SetContext(ctx)

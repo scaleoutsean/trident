@@ -1,0 +1,15 @@
+---
+kind: Role
+apiVersion: "rbac.authorization.k8s.io/v1"
+metadata:
+  namespace: trident
+  name: trident-node-linux
+  labels:
+    app: node.csi.trident.netapp.io
+    kubectl.kubernetes.io/default-container: trident-main
+rules:
+  - apiGroups: ["policy"]
+    resources: ["podsecuritypolicies"]
+    verbs: ["use"]
+    resourceNames:
+      - trident-node-linux

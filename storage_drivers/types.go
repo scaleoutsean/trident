@@ -135,6 +135,7 @@ type OntapStorageDriverConfig struct {
 	TrustedCACertificate      string                   `json:"trustedCACertificate"`
 	ReplicationPolicy         string                   `json:"replicationPolicy"`
 	ReplicationSchedule       string                   `json:"replicationSchedule"`
+	FlexGroupAggregateList    []string                 `json:"flexgroupAggregateList"`
 }
 
 type OntapStorageDriverPool struct {
@@ -142,6 +143,8 @@ type OntapStorageDriverPool struct {
 	Region                           string              `json:"region"`
 	Zone                             string              `json:"zone"`
 	SupportedTopologies              []map[string]string `json:"supportedTopologies"`
+	NASType                          string              `json:"nasType"`
+	SMBShare                         string              `json:"smbShare"`
 	OntapStorageDriverConfigDefaults `json:"defaults"`
 }
 
@@ -531,6 +534,7 @@ type GCPNFSStorageDriverPool struct {
 	Zone                              string              `json:"zone"`
 	ServiceLevel                      string              `json:"serviceLevel"`
 	StorageClass                      string              `json:"storageClass"`
+	StoragePools                      []string            `json:"storagePools"`
 	Network                           string              `json:"network"`
 	SupportedTopologies               []map[string]string `json:"supportedTopologies"`
 	GCPNFSStorageDriverConfigDefaults `json:"defaults"`
@@ -643,6 +647,8 @@ type FakeStorageDriverConfig struct {
 	Storage      []FakeStorageDriverPool `json:"storage"`
 	Username     string                  `json:"username"`
 	Password     string                  `json:"password"`
+	// Dummy field for unit tests
+	VolumeAccess string `json:"volumeAccess"`
 	FakeStorageDriverPool
 }
 

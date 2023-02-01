@@ -37,6 +37,7 @@ type Orchestrator interface {
 	RemoveBackendConfigRef(ctx context.Context, backendUUID, configRef string) (err error)
 
 	AddVolume(ctx context.Context, volumeConfig *storage.VolumeConfig) (*storage.VolumeExternal, error)
+	UpdateVolume(ctx context.Context, volume string, passphraseNames *[]string) error
 	AttachVolume(ctx context.Context, volumeName, mountpoint string, publishInfo *utils.VolumePublishInfo) error
 	CloneVolume(ctx context.Context, volumeConfig *storage.VolumeConfig) (*storage.VolumeExternal, error)
 	DetachVolume(ctx context.Context, volumeName, mountpoint string) error
@@ -79,14 +80,14 @@ type Orchestrator interface {
 	PeriodicallyReconcileNodeAccessOnBackends()
 
 	AddVolumePublication(ctx context.Context, vp *utils.VolumePublication) error
-	UpdateVolumePublication(ctx context.Context, nodeName, volumeName string, notSafeToAttach *bool) error
+	UpdateVolumePublication(ctx context.Context, volumeName, nodeName string, notSafeToAttach *bool) error
 	GetVolumePublication(ctx context.Context, volumeName, nodeName string) (*utils.VolumePublication, error)
-	ListVolumePublications(ctx context.Context) ([]*utils.VolumePublicationExternal, error)
+	ListVolumePublications(ctx context.Context, notSafeToAttach *bool) ([]*utils.VolumePublicationExternal, error)
 	ListVolumePublicationsForVolume(
-		ctx context.Context, volumeName string,
+		ctx context.Context, volumeName string, notSafeToAttach *bool,
 	) (publications []*utils.VolumePublicationExternal, err error)
 	ListVolumePublicationsForNode(
-		ctx context.Context, nodeName string,
+		ctx context.Context, nodeName string, notSafeToAttach *bool,
 	) (publications []*utils.VolumePublicationExternal, err error)
 	DeleteVolumePublication(ctx context.Context, volumeName, nodeName string) error
 

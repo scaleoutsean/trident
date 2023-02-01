@@ -5,6 +5,7 @@ package utils
 import (
 	"context"
 	"fmt"
+	"io/fs"
 	"io/ioutil"
 	"math/rand"
 	"os"
@@ -13,8 +14,19 @@ import (
 	"time"
 
 	log "github.com/sirupsen/logrus"
+	"github.com/spf13/afero"
 	"github.com/stretchr/testify/assert"
 )
+
+// MockFs is a struct that embeds the afero in-memory filesystem, so that we can
+// implement a version of Open that can return a permissions error.
+type MockFs struct {
+	afero.MemMapFs
+}
+
+func (m *MockFs) Open(name string) (afero.File, error) {
+	return nil, fs.ErrPermission
+}
 
 var testStringSlice = []string{
 	"foo",
@@ -1332,11 +1344,19 @@ func TestParseHostportIP(t *testing.T) {
 			OutputIP: "1.2.3.4",
 		},
 		{
+			InputIP:  "1.2.3.4:5678,1001",
+			OutputIP: "1.2.3.4",
+		},
+		{
 			InputIP:  "1.2.3.4",
 			OutputIP: "1.2.3.4",
 		},
 		{
 			InputIP:  "[1:2:3:4]:5678",
+			OutputIP: "[1:2:3:4]",
+		},
+		{
+			InputIP:  "[1:2:3:4]:5678,1001",
 			OutputIP: "[1:2:3:4]",
 		},
 		{
@@ -1349,6 +1369,10 @@ func TestParseHostportIP(t *testing.T) {
 		},
 		{
 			InputIP:  "[2607:f8b0:4006:818:0:0:0:2004]:5678",
+			OutputIP: "[2607:f8b0:4006:818:0:0:0:2004]",
+		},
+		{
+			InputIP:  "[2607:f8b0:4006:818:0:0:0:2004]:5678,1001",
 			OutputIP: "[2607:f8b0:4006:818:0:0:0:2004]",
 		},
 		{
@@ -1442,4 +1466,18 @@ func TestGetPrintableBoolPtrValue(t *testing.T) {
 	tmp = true
 	pval = GetPrintableBoolPtrValue(bPtr)
 	assert.Equal(t, "true", pval)
+}
+
+func TestPtr(t *testing.T) {
+	i := 42
+	pi := Ptr(i)
+	assert.Equal(t, i, *pi)
+
+	s := "test"
+	ps := Ptr(s)
+	assert.Equal(t, s, *ps)
+
+	a := [2]int{1, 2}
+	pa := Ptr(a)
+	assert.Equal(t, a, *pa)
 }

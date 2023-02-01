@@ -3,6 +3,8 @@
 package installer
 
 import (
+	v1 "k8s.io/api/core/v1"
+
 	"github.com/netapp/trident/config"
 )
 
@@ -18,6 +20,11 @@ var (
 	TridentVersionLabelKey   = "trident_version"
 	TridentVersionLabelValue = "v" + DefaultTridentVersion // need to append 'v', otherwise label freaks out
 	TridentVersionLabel      = TridentVersionLabelKey + "=" + TridentVersionLabelValue
+
+	// Names of Trident deployment/daemonset objects managed by the operator
+	TridentDeploymentName       = TridentControllerResourceName
+	TridentLinuxDaemonsetName   = TridentNodeLinuxResourceName
+	TridentWindowsDaemonsetName = TridentNodeWindowsResourceName
 )
 
 const (
@@ -81,4 +88,7 @@ const (
 	CRKind          = "kind"
 	CRName          = "name"
 	CRUID           = "uid"
+
+	// DefaultImagePullPolicy is the trident image pull policy.
+	DefaultImagePullPolicy = string(v1.PullIfNotPresent)
 )

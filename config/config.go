@@ -40,12 +40,14 @@ const (
 	OrchestratorName                 = "trident"
 	OrchestratorClientName           = OrchestratorName + "ctl"
 	OrchestratorAPIVersion           = "1"
-	DefaultOrchestratorVersion       = "22.10.0"
+	DefaultOrchestratorVersion       = "23.01.0"
 	PersistentStoreBootstrapAttempts = 30
 	PersistentStoreBootstrapTimeout  = PersistentStoreBootstrapAttempts * time.Second
 	PersistentStoreTimeout           = 10 * time.Second
 	DockerCreateTimeout              = 115 * time.Second
 	DockerDefaultTimeout             = 55 * time.Second
+	CSIUnixSocketPermissions         = 0o600
+	CSISocketDirPermissions          = 0o600
 
 	/* REST/HTTP constants */
 	HTTPTimeout       = 90 * time.Second
@@ -137,13 +139,14 @@ const (
 	PlatformCSI        Platform = "csi" // plain CSI, no other CO present
 
 	// Minimum and maximum supported Kubernetes versions
-	KubernetesVersionMin = "v1.20"
-	KubernetesVersionMax = "v1.25"
+	KubernetesVersionMin = "v1.21"
+	KubernetesVersionMax = "v1.26"
 
 	// KubernetesCSISidecarRegistry is where the CSI sidecar images are hosted
 	KubernetesCSISidecarRegistry = "registry.k8s.io/sig-storage"
 
-	NamespaceFile = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+	NamespaceFile          = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+	VolumeTrackingInfoPath = "/var/lib/trident/tracking"
 
 	// Pod Security Standards
 	PodSecurityStandardsEnforceLabel   = "pod-security.kubernetes.io/enforce"
@@ -154,7 +157,13 @@ const (
 	/* Kubernetes operator constants */
 	OperatorContainerName = "trident-operator"
 
-	DefaultAutosupportImage = "docker.io/netapp/trident-autosupport:22.10"
+	DefaultAutosupportImage = "docker.io/netapp/trident-autosupport:23.01"
+
+	// IscsiSelfHealingInterval is an interval with which the iSCSI self-healing thread is called periodically
+	IscsiSelfHealingInterval = 300 * time.Second
+
+	// ISCSISelfHealingWaitTime is an interval after which iSCSI self-healing attempts to fix stale sessions.
+	ISCSISelfHealingWaitTime = 420 * time.Second
 )
 
 var (
@@ -195,11 +204,25 @@ var (
 	NodeURL         = "/" + OrchestratorName + "/v" + OrchestratorAPIVersion + "/node"
 	SnapshotURL     = "/" + OrchestratorName + "/v" + OrchestratorAPIVersion + "/snapshot"
 	ChapURL         = "/" + OrchestratorName + "/v" + OrchestratorAPIVersion + "/chap"
+	PublicationURL  = "/" + OrchestratorName + "/v" + OrchestratorAPIVersion + "/publication"
 	StoreURL        = "/" + OrchestratorName + "/store"
 
 	UsingPassthroughStore bool
 	CurrentDriverContext  DriverContext
 	OrchestratorTelemetry = Telemetry{TridentVersion: OrchestratorVersion.String()}
+
+	// CSIAccessModes are defined by CSI
+	// See https://github.com/container-storage-interface/spec/blob/release-1.5/lib/go/csi/csi.pb.go#L135
+	CSIAccessModes = map[int32]string{
+		0: "UNKNOWN",
+		1: "SINGLE_NODE_WRITER",
+		2: "SINGLE_NODE_READER_ONLY",
+		3: "MULTI_NODE_READER_ONLY",
+		4: "MULTI_NODE_SINGLE_WRITER",
+		5: "MULTI_NODE_MULTI_WRITER",
+		6: "SINGLE_NODE_SINGLE_WRITER",
+		7: "SINGLE_NODE_MULTI_WRITER",
+	}
 )
 
 func IsValidProtocol(p Protocol) bool {

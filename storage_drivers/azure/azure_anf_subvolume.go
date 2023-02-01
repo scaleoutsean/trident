@@ -39,7 +39,14 @@ var (
 	subvolumeNameRegex          = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9-]{0,39}$`)
 	subvolumeSnapshotNameRegex  = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9-]{0,44}$`)
 	subvolumeCreationTokenRegex = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9-]{0,63}$`)
+
+	pollerResponseCache = make(map[PollerKey]api.PollerResponse)
 )
+
+type PollerKey struct {
+	ID        string
+	Operation string
+}
 
 type SubvolumeHelper struct {
 	Config         drivers.AzureNASStorageDriverConfig
@@ -656,16 +663,23 @@ func (d *NASBlockStorageDriver) Create(
 		volConfig.InternalName = extantSubvolume.Name
 		volConfig.InternalID = extantSubvolume.ID
 
-		if extantSubvolume.ProvisioningState == api.StateCreating {
-			// This is a retry and the subvolume still isn't ready, so no need to wait further.
-			return utils.VolumeCreatingError(
-				fmt.Sprintf("volume state is still %s, not %s", api.StateCreating, api.StateAvailable))
-		}
-
 		Logc(ctx).WithFields(log.Fields{
 			"name":  volConfig.InternalName,
 			"state": extantSubvolume.ProvisioningState,
 		}).Warning("Subvolume already exists.")
+
+		// Get the reference object
+		pollerKey := PollerKey{
+			ID:        extantSubvolume.Name,
+			Operation: "add",
+		}
+
+		poller := pollerResponseCache[pollerKey]
+
+		// Wait for creation to complete
+		if err = d.waitForSubvolumeCreate(ctx, extantSubvolume, poller); err != nil {
+			return err
+		}
 
 		return drivers.NewVolumeExistsError(volConfig.InternalName)
 	}
@@ -713,7 +727,7 @@ func (d *NASBlockStorageDriver) Create(
 	}
 
 	// Create the volume
-	subvolume, err := d.SDK.CreateSubvolume(ctx, subvolumeCreateRequest)
+	subvolume, poller, err := d.SDK.CreateSubvolume(ctx, subvolumeCreateRequest)
 	if err != nil {
 		return err
 	}
@@ -721,8 +735,16 @@ func (d *NASBlockStorageDriver) Create(
 	// Always save the ID so we can find the volume efficiently later
 	volConfig.InternalID = subvolume.ID
 
+	// Save the Poller's reference for later uses (if needed)
+	pollerKey := PollerKey{
+		ID:        subvolume.Name,
+		Operation: "add",
+	}
+
+	pollerResponseCache[pollerKey] = poller
+
 	// Wait for creation to complete
-	return d.waitForSubvolumeCreate(ctx, subvolume)
+	return d.waitForSubvolumeCreate(ctx, subvolume, poller)
 }
 
 // CreateClone clones an existing volume.  If a snapshot is not specified, one is created.
@@ -787,16 +809,23 @@ func (d *NASBlockStorageDriver) CreateClone(
 		volConfig.InternalName = extantSubvolume.Name
 		volConfig.InternalID = extantSubvolume.ID
 
-		if extantSubvolume.ProvisioningState == api.StateCreating {
-			// This is a retry and the subvolume still isn't ready, so no need to wait further.
-			return utils.VolumeCreatingError(
-				fmt.Sprintf("volume state is still %s, not %s", api.StateCreating, api.StateAvailable))
-		}
-
 		Logc(ctx).WithFields(log.Fields{
 			"name":  volConfig.InternalName,
 			"state": extantSubvolume.ProvisioningState,
 		}).Warning("Subvolume already exists.")
+
+		// Get the reference object
+		pollerKey := PollerKey{
+			ID:        extantSubvolume.Name,
+			Operation: "add",
+		}
+
+		poller := pollerResponseCache[pollerKey]
+
+		// Wait for creation to complete
+		if err = d.waitForSubvolumeCreate(ctx, extantSubvolume, poller); err != nil {
+			return err
+		}
 
 		return drivers.NewVolumeExistsError(volConfig.InternalName)
 	}
@@ -819,7 +848,7 @@ func (d *NASBlockStorageDriver) CreateClone(
 		Parent:        sourceSubvolume.Name, // Needed only when cloning
 	}
 	// Create the volume
-	subvolume, err := d.SDK.CreateSubvolume(ctx, subvolumeCreateRequest)
+	subvolume, poller, err := d.SDK.CreateSubvolume(ctx, subvolumeCreateRequest)
 	if err != nil {
 		return err
 	}
@@ -827,8 +856,16 @@ func (d *NASBlockStorageDriver) CreateClone(
 	// Always save the ID so we can find the volume efficiently later
 	volConfig.InternalID = subvolume.ID
 
+	// Save the Poller's reference for later uses (if needed)
+	pollerKey := PollerKey{
+		ID:        subvolume.Name,
+		Operation: "add",
+	}
+
+	pollerResponseCache[pollerKey] = poller
+
 	// Wait for creation to complete
-	return d.waitForSubvolumeCreate(ctx, subvolume)
+	return d.waitForSubvolumeCreate(ctx, subvolume, poller)
 }
 
 // Import finds an existing subvolume and makes it available for containers. If ImportNotManaged is false, the
@@ -899,7 +936,11 @@ func (d *NASBlockStorageDriver) Rename(ctx context.Context, name, newName string
 // waitForSubvolumeCreate waits for volume creation to complete by reaching the Available state.  If the
 // volume reaches a terminal state (Error), the volume is deleted.  If the wait times out and the volume
 // is still creating, a VolumeCreatingError is returned so the caller may try again.
-func (d *NASBlockStorageDriver) waitForSubvolumeCreate(ctx context.Context, subvolume *api.Subvolume) error {
+func (d *NASBlockStorageDriver) waitForSubvolumeCreate(ctx context.Context, subvolume *api.Subvolume,
+	poller api.PollerResponse,
+) error {
+	var pollForError bool
+
 	state, err := d.SDK.WaitForSubvolumeState(
 		ctx, subvolume, api.StateAvailable, []string{api.StateError}, d.volumeCreateTimeout)
 	if err != nil {
@@ -923,7 +964,7 @@ func (d *NASBlockStorageDriver) waitForSubvolumeCreate(ctx context.Context, subv
 
 		case api.StateError:
 			// Delete a failed volume
-			errDelete := d.SDK.DeleteSubvolume(ctx, subvolume)
+			_, errDelete := d.SDK.DeleteSubvolume(ctx, subvolume)
 			if errDelete != nil {
 				Logc(ctx).WithFields(logFields).WithError(errDelete).Error(
 					"Subvolume could not be cleaned up and must be manually deleted.")
@@ -931,11 +972,31 @@ func (d *NASBlockStorageDriver) waitForSubvolumeCreate(ctx context.Context, subv
 				Logc(ctx).WithField("subvolume", subvolume.Name).Info("Subvolume deleted.")
 			}
 
+			pollForError = true
+
 		case api.StateMoving:
 			fallthrough
 
 		default:
 			Logc(ctx).WithFields(logFields).Errorf("unexpected subvolume state %s found for subvolume", state)
+			pollForError = true
+		}
+	}
+
+	// If here, it mean volume might be successful, or in deleting, error, moving or unexpected state,
+	// and not in creating state, so it should be safe to remove it from futures cache
+	pollerKey := PollerKey{
+		ID:        subvolume.Name,
+		Operation: "add",
+	}
+
+	delete(pollerResponseCache, pollerKey)
+
+	if pollForError && poller != nil {
+		if err != nil && state == api.StateError {
+			Logc(ctx).Errorf("failed to create subvolume: %v", poller.Result(ctx))
+		} else {
+			return poller.Result(ctx)
 		}
 	}
 
@@ -993,7 +1054,8 @@ func (d *NASBlockStorageDriver) Destroy(ctx context.Context, volConfig *storage.
 	}
 
 	// Delete the subvolume
-	if err := d.SDK.DeleteSubvolume(ctx, extantSubvolume); err != nil {
+	poller, err := d.SDK.DeleteSubvolume(ctx, extantSubvolume)
+	if err != nil {
 		if !utils.IsNotFoundError(err) {
 			return fmt.Errorf("error deleting subvolume %s; %v", creationToken, err)
 		}
@@ -1002,8 +1064,12 @@ func (d *NASBlockStorageDriver) Destroy(ctx context.Context, volConfig *storage.
 	Logc(ctx).WithField("subvolume", extantSubvolume.Name).Info("subvolume deleted.")
 
 	// Wait for deletion to complete
-	_, err = d.SDK.WaitForSubvolumeState(ctx, extantSubvolume, api.StateDeleted, []string{api.StateError},
+	state, err := d.SDK.WaitForSubvolumeState(ctx, extantSubvolume, api.StateDeleted, []string{api.StateError},
 		d.defaultTimeout())
+
+	if err != nil && state == api.StateError {
+		Logc(ctx).WithField("subvolume", extantSubvolume.Name).Errorf("failed to delete volume: %v", poller.Result(ctx))
+	}
 
 	return err
 }
@@ -1210,21 +1276,24 @@ func (d *NASBlockStorageDriver) GetSnapshots(
 }
 
 // CreateSnapshot creates a snapshot for the given volume
-// NOTE: In ANF Subvolumes there is not concept of snapshots, therefore any new snapshot is another
-//       subvolume copy of the source subvolume.
+// NOTE: In ANF Subvolumes there is no concept of snapshots, therefore any new snapshot is another
+// subvolume copy of the source subvolume.
 func (d *NASBlockStorageDriver) CreateSnapshot(
 	ctx context.Context, snapConfig *storage.SnapshotConfig, volConfig *storage.VolumeConfig,
 ) (*storage.Snapshot, error) {
 	snapName := snapConfig.Name
 	internalVolName := snapConfig.VolumeInternalName
 
+	var poller api.PollerResponse
+
+	fields := log.Fields{
+		"Method":       "CreateSnapshot",
+		"Type":         "NASBlockStorageDriver",
+		"snapshotName": snapName,
+		"volumeName":   internalVolName,
+	}
+
 	if d.Config.DebugTraceFlags["method"] {
-		fields := log.Fields{
-			"Method":       "CreateSnapshot",
-			"Type":         "NASBlockStorageDriver",
-			"snapshotName": snapName,
-			"volumeName":   internalVolName,
-		}
 		Logc(ctx).WithFields(fields).Debug(">>>> CreateSnapshot")
 		defer Logc(ctx).WithFields(fields).Debug("<<<< CreateSnapshot")
 	}
@@ -1278,7 +1347,7 @@ func (d *NASBlockStorageDriver) CreateSnapshot(
 		}
 
 		// Create the snapshot
-		subvolume, err = d.SDK.CreateSubvolume(ctx, subvolumeCreateRequest)
+		subvolume, poller, err = d.SDK.CreateSubvolume(ctx, subvolumeCreateRequest)
 		if err != nil {
 			return nil, err
 		}
@@ -1288,7 +1357,15 @@ func (d *NASBlockStorageDriver) CreateSnapshot(
 	// use the current timestamp
 	createdAt := time.Now()
 
-	if err = d.waitForSubvolumeCreate(ctx, subvolume); err != nil {
+	// Save the Poller's reference for later uses (if needed)
+	pollerKey := PollerKey{
+		ID:        subvolume.Name,
+		Operation: "add",
+	}
+
+	pollerResponseCache[pollerKey] = poller
+
+	if err = d.waitForSubvolumeCreate(ctx, subvolume, poller); err != nil {
 		return nil, err
 	}
 
@@ -1368,7 +1445,8 @@ func (d *NASBlockStorageDriver) DeleteSnapshot(
 	}
 
 	// If the specified snapshot subvolume already exists, return an error
-	if err = d.SDK.DeleteSubvolume(ctx, subvolume); err != nil {
+	poller, err := d.SDK.DeleteSubvolume(ctx, subvolume)
+	if err != nil {
 		if !utils.IsNotFoundError(err) {
 			return fmt.Errorf("error deleting snapshot %s; %v", creationToken, err)
 		}
@@ -1377,10 +1455,14 @@ func (d *NASBlockStorageDriver) DeleteSnapshot(
 	Logc(ctx).Debugf("Snapshot %s deleted.", creationToken)
 
 	// Wait for deletion to complete
-	_, err = d.SDK.WaitForSubvolumeState(ctx, subvolume, api.StateDeleted, []string{api.StateError},
+	state, err := d.SDK.WaitForSubvolumeState(ctx, subvolume, api.StateDeleted, []string{api.StateError},
 		d.defaultTimeout())
 
-	return nil
+	if err != nil && state == api.StateError {
+		Logc(ctx).WithField("subvolume", subvolume.Name).Errorf("failed to delete volume: %v", poller.Result(ctx))
+	}
+
+	return err
 }
 
 // Get tests for the existence of a volume
@@ -1444,13 +1526,6 @@ func (d *NASBlockStorageDriver) Resize(ctx context.Context, volConfig *storage.V
 	// Resize the subvolume
 	if err = d.SDK.ResizeSubvolume(ctx, subvolumeWithMetadata, int64(sizeBytes)); err != nil {
 		return err
-	}
-
-	// Wait for resize operation to complete
-	_, err = d.SDK.WaitForSubvolumeState(ctx, subvolumeWithMetadata, api.StateAvailable, []string{api.StateError},
-		d.defaultTimeout())
-	if err != nil {
-		return fmt.Errorf("could not resize subvolume %s; %v", name, err)
 	}
 
 	volConfig.Size = strconv.FormatUint(sizeBytes, 10)

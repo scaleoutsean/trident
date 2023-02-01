@@ -26,7 +26,7 @@ import (
 	"github.com/netapp/trident/utils"
 )
 
-// NASFlexGroupStorageDriver is for NFS FlexGroup storage provisioning
+// NASFlexGroupStorageDriver is for NFS and SMB FlexGroup storage provisioning
 type NASFlexGroupStorageDriver struct {
 	initialized bool
 	Config      drivers.OntapStorageDriverConfig
@@ -173,6 +173,7 @@ func (d *NASFlexGroupStorageDriver) initializeStoragePools(ctx context.Context) 
 	}
 
 	pool.Attributes()[sa.Labels] = sa.NewLabelOffer(config.Labels)
+	pool.Attributes()[sa.NASType] = sa.NewStringOffer(config.NASType)
 
 	if len(mediaOffers) > 0 {
 		pool.Attributes()[sa.Media] = sa.NewStringOfferFromOffers(mediaOffers...)
@@ -288,7 +289,13 @@ func (d *NASFlexGroupStorageDriver) initializeStoragePools(ctx context.Context) 
 				pool.Attributes()[attrName] = offer
 			}
 
+			nasType := config.NASType
+			if vpool.NASType != "" {
+				nasType = vpool.NASType
+			}
+
 			pool.Attributes()[sa.Labels] = sa.NewLabelOffer(config.Labels, vpool.Labels)
+			pool.Attributes()[sa.NASType] = sa.NewStringOffer(nasType)
 
 			if region != "" {
 				pool.Attributes()[sa.Region] = sa.NewStringOffer(region)
@@ -417,6 +424,24 @@ func (d *NASFlexGroupStorageDriver) validate(ctx context.Context) error {
 		return fmt.Errorf("storage pool validation failed: %v", err)
 	}
 
+	// Get the aggregates assigned to the SVM.  There must be at least one!
+	vserverAggrs, err := d.API.GetSVMAggregateNames(ctx)
+	if err != nil {
+		return err
+	}
+
+	if len(vserverAggrs) == 0 {
+		return fmt.Errorf("no assigned aggregates found")
+	}
+
+	if len(d.Config.FlexGroupAggregateList) > 0 {
+		containsAll, _ := utils.SliceContainsElements(vserverAggrs, d.Config.FlexGroupAggregateList)
+		if !containsAll {
+			return fmt.Errorf("not all aggregates specified in the flexgroupAggregateList are assigned to the SVM;  flexgroupAggregateList: %v assigned aggregates: %v",
+				d.Config.FlexGroupAggregateList, vserverAggrs)
+		}
+	}
+
 	return nil
 }
 
@@ -457,18 +482,23 @@ func (d *NASFlexGroupStorageDriver) Create(
 		return err
 	}
 
-	vserverAggrNames := make([]azgo.AggrNameType, 0)
-	vserverAggrNames = append(vserverAggrNames, vserverAggrs...)
+	var flexGroupAggregateList []string
+	if len(d.Config.FlexGroupAggregateList) == 0 {
+		// by default, the list of aggregates to use when creating the FlexGroup is derived from those assigned to the SVM
+		vserverAggrNames := make([]azgo.AggrNameType, 0)
+		vserverAggrNames = append(vserverAggrNames, vserverAggrs...)
+		flexGroupAggregateList = vserverAggrNames
+	} else {
+		// allow the user to override the list of aggregates to use when creating the FlexGroup
+		flexGroupAggregateList = d.Config.FlexGroupAggregateList
+	}
 
 	Logc(ctx).WithFields(log.Fields{
 		"aggregates": vserverAggrs,
 	}).Debug("Read aggregates assigned to SVM.")
 
 	// Get options
-	opts, err := d.GetVolumeOpts(ctx, volConfig, volAttributes)
-	if err != nil {
-		return err
-	}
+	opts := d.GetVolumeOpts(ctx, volConfig, volAttributes)
 
 	// get options with default fallback values
 	// see also: ontap_common.go#PopulateConfigurationDefaults
@@ -547,7 +577,7 @@ func (d *NASFlexGroupStorageDriver) Create(
 		"unixPermissions": unixPermissions,
 		"snapshotDir":     enableSnapshotDir,
 		"exportPolicy":    exportPolicy,
-		"aggregates":      vserverAggrNames,
+		"aggregates":      flexGroupAggregateList,
 		"securityStyle":   securityStyle,
 		"encryption":      utils.GetPrintableBoolPtrValue(enableEncryption),
 		"qosPolicy":       qosPolicy,
@@ -567,7 +597,7 @@ func (d *NASFlexGroupStorageDriver) Create(
 		// Create the FlexGroup
 		err = d.API.FlexgroupCreate(
 			ctx, api.Volume{
-				Aggregates:      vserverAggrNames,
+				Aggregates:      flexGroupAggregateList,
 				Comment:         labels,
 				Encrypt:         enableEncryption,
 				ExportPolicy:    exportPolicy,
@@ -726,10 +756,7 @@ func (d *NASFlexGroupStorageDriver) CreateClone(
 		defer Logc(ctx).WithFields(fields).Debug("<<<< CreateClone")
 	}
 
-	opts, err := d.GetVolumeOpts(context.Background(), cloneVolConfig, make(map[string]sa.Request))
-	if err != nil {
-		return err
-	}
+	opts := d.GetVolumeOpts(context.Background(), cloneVolConfig, make(map[string]sa.Request))
 
 	// How "splitOnClone" value gets set:
 	// In the Core we first check clone's VolumeConfig for splitOnClone value
@@ -825,9 +852,20 @@ func (d *NASFlexGroupStorageDriver) Import(
 	if !volConfig.ImportNotManaged {
 		// unixPermissions specified in PVC annotation takes precedence over backend's unixPermissions config
 		unixPerms := volConfig.UnixPermissions
-		if unixPerms == "" {
-			unixPerms = d.Config.UnixPermissions
+
+		switch d.Config.NASType {
+		case sa.SMB:
+			if unixPerms == "" && d.Config.SecurityStyle == "mixed" {
+				unixPerms = d.Config.UnixPermissions
+			} else if d.Config.SecurityStyle == "ntfs" {
+				unixPerms = ""
+			}
+		case sa.NFS:
+			if unixPerms == "" {
+				unixPerms = d.Config.UnixPermissions
+			}
 		}
+
 		if err := d.API.FlexgroupModifyUnixPermissions(ctx, volConfig.InternalName, originalName,
 			unixPerms); err != nil {
 			return err
@@ -899,10 +937,16 @@ func (d *NASFlexGroupStorageDriver) Publish(
 	}
 
 	// Add fields needed by Attach
-	publishInfo.NfsPath = fmt.Sprintf("/%s", name)
-	publishInfo.NfsServerIP = d.Config.DataLIF
-	publishInfo.FilesystemType = "nfs"
-	publishInfo.MountOptions = mountOptions
+	if d.Config.NASType == sa.SMB {
+		publishInfo.SMBPath = volConfig.AccessInfo.SMBPath
+		publishInfo.SMBServer = d.Config.DataLIF
+		publishInfo.FilesystemType = sa.SMB
+	} else {
+		publishInfo.NfsPath = fmt.Sprintf("/%s", name)
+		publishInfo.NfsServerIP = d.Config.DataLIF
+		publishInfo.FilesystemType = sa.NFS
+		publishInfo.MountOptions = mountOptions
+	}
 
 	return publishShare(ctx, d.API, &d.Config, publishInfo, name, d.API.FlexgroupModifyExportPolicy)
 }
@@ -1262,8 +1306,8 @@ func (d *NASFlexGroupStorageDriver) getStoragePoolAttributes() map[string]sa.Off
 
 func (d *NASFlexGroupStorageDriver) GetVolumeOpts(
 	ctx context.Context, volConfig *storage.VolumeConfig, requests map[string]sa.Request,
-) (map[string]string, error) {
-	return getVolumeOptsCommon(ctx, volConfig, requests), nil
+) map[string]string {
+	return getVolumeOptsCommon(ctx, volConfig, requests)
 }
 
 func (d *NASFlexGroupStorageDriver) GetInternalVolumeName(_ context.Context, name string) string {
@@ -1275,9 +1319,14 @@ func (d *NASFlexGroupStorageDriver) CreatePrepare(ctx context.Context, volConfig
 }
 
 func (d *NASFlexGroupStorageDriver) CreateFollowup(ctx context.Context, volConfig *storage.VolumeConfig) error {
-	volConfig.AccessInfo.NfsServerIP = d.Config.DataLIF
-	volConfig.AccessInfo.MountOptions = strings.TrimPrefix(d.Config.NfsMountOptions, "-o ")
-	volConfig.FileSystem = ""
+	if d.Config.NASType == sa.SMB {
+		volConfig.AccessInfo.SMBServer = d.Config.DataLIF
+		volConfig.FileSystem = sa.SMB
+	} else {
+		volConfig.AccessInfo.NfsServerIP = d.Config.DataLIF
+		volConfig.AccessInfo.MountOptions = strings.TrimPrefix(d.Config.NfsMountOptions, "-o ")
+		volConfig.FileSystem = sa.NFS
+	}
 
 	// Set correct junction path
 	flexgroup, err := d.API.FlexgroupInfo(ctx, volConfig.InternalName)
@@ -1289,12 +1338,28 @@ func (d *NASFlexGroupStorageDriver) CreateFollowup(ctx context.Context, volConfi
 
 	if flexgroup.JunctionPath == "" {
 		// Flexgroup is not mounted, we need to mount it
-		volConfig.AccessInfo.NfsPath = "/" + volConfig.InternalName
-		if err := d.API.FlexgroupMount(ctx, volConfig.InternalName, volConfig.AccessInfo.NfsPath); err != nil {
-			return fmt.Errorf("error mounting volume to junction %s; %v", volConfig.AccessInfo.NfsPath, err)
+
+		if d.Config.NASType == sa.SMB {
+			volConfig.AccessInfo.SMBPath = ConstructOntapNASFlexGroupSMBVolumePath(ctx, d.Config.SMBShare,
+				volConfig.InternalName)
+			err = d.MountFlexgroup(ctx, volConfig.InternalName, volConfig.AccessInfo.SMBPath)
+			if err != nil {
+				return err
+			}
+		} else {
+			volConfig.AccessInfo.NfsPath = "/" + volConfig.InternalName
+			err = d.MountFlexgroup(ctx, volConfig.InternalName, volConfig.AccessInfo.NfsPath)
+			if err != nil {
+				return err
+			}
 		}
 	} else {
-		volConfig.AccessInfo.NfsPath = flexgroup.JunctionPath
+		if d.Config.NASType == sa.SMB {
+			volConfig.AccessInfo.SMBPath = ConstructOntapNASFlexGroupSMBVolumePath(ctx, d.Config.SMBShare,
+				flexgroup.JunctionPath)
+		} else {
+			volConfig.AccessInfo.NfsPath = flexgroup.JunctionPath
+		}
 	}
 
 	return nil
@@ -1402,10 +1467,6 @@ func (d *NASFlexGroupStorageDriver) GetUpdateType(_ context.Context, driverOrig 
 		return bitmap
 	}
 
-	if d.Config.DataLIF != dOrig.Config.DataLIF {
-		bitmap.Add(storage.VolumeAccessInfoChange)
-	}
-
 	if d.Config.Password != dOrig.Config.Password {
 		bitmap.Add(storage.PasswordChange)
 	}
@@ -1502,4 +1563,12 @@ func (d NASFlexGroupStorageDriver) GoString() string {
 // GetCommonConfig returns driver's CommonConfig
 func (d NASFlexGroupStorageDriver) GetCommonConfig(context.Context) *drivers.CommonStorageDriverConfig {
 	return d.Config.CommonStorageDriverConfig
+}
+
+// MountFlexgroup returns the flexgroup volume mount error(if any)
+func (d NASFlexGroupStorageDriver) MountFlexgroup(ctx context.Context, name, junctionPath string) error {
+	if err := d.API.FlexgroupMount(ctx, name, junctionPath); err != nil {
+		return fmt.Errorf("error mounting volume to junction %s; %v", junctionPath, err)
+	}
+	return nil
 }

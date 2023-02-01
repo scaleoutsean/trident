@@ -4,11 +4,13 @@ package csi
 
 import (
 	"context"
+	"fmt"
 	"io/ioutil"
 	"os"
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	log "github.com/sirupsen/logrus"
@@ -18,7 +20,8 @@ import (
 	tridentconfig "github.com/netapp/trident/config"
 	"github.com/netapp/trident/core"
 	controllerAPI "github.com/netapp/trident/frontend/csi/controller_api"
-	"github.com/netapp/trident/frontend/csi/helpers"
+	controllerhelpers "github.com/netapp/trident/frontend/csi/controller_helpers"
+	nodehelpers "github.com/netapp/trident/frontend/csi/node_helpers"
 	. "github.com/netapp/trident/logger"
 	"github.com/netapp/trident/utils"
 )
@@ -38,12 +41,14 @@ type Plugin struct {
 	endpoint string
 	role     string
 
-	unsafeDetach bool
+	unsafeDetach      bool
+	enableForceDetach bool
 
 	hostInfo *utils.HostSystem
 
-	restClient controllerAPI.TridentController
-	helper     helpers.HybridPlugin
+	restClient       controllerAPI.TridentController
+	controllerHelper controllerhelpers.ControllerHelper
+	nodeHelper       nodehelpers.NodeHelper
 
 	aesKey []byte
 
@@ -56,22 +61,27 @@ type Plugin struct {
 	opCache sync.Map
 
 	nodeIsRegistered bool
+
+	iSCSISelfHealingTicker   *time.Ticker
+	iSCSISelfHealingChannel  chan struct{}
+	iSCSISelfHealingInterval time.Duration
+	iSCSISelfHealingWaitTime time.Duration
 }
 
 func NewControllerPlugin(
-	nodeName, endpoint, aesKeyFile string, orchestrator core.Orchestrator, helper *helpers.HybridPlugin,
+	nodeName, endpoint, aesKeyFile string, orchestrator core.Orchestrator, helper *controllerhelpers.ControllerHelper,
 ) (*Plugin, error) {
 	ctx := GenerateRequestContext(context.Background(), "", ContextSourceInternal)
 
 	p := &Plugin{
-		orchestrator: orchestrator,
-		name:         Provisioner,
-		nodeName:     nodeName,
-		version:      tridentconfig.OrchestratorVersion.ShortString(),
-		endpoint:     endpoint,
-		role:         CSIController,
-		helper:       *helper,
-		opCache:      sync.Map{},
+		orchestrator:     orchestrator,
+		name:             Provisioner,
+		nodeName:         nodeName,
+		version:          tridentconfig.OrchestratorVersion.ShortString(),
+		endpoint:         endpoint,
+		role:             CSIController,
+		controllerHelper: *helper,
+		opCache:          sync.Map{},
 	}
 
 	var err error
@@ -106,19 +116,32 @@ func NewControllerPlugin(
 
 func NewNodePlugin(
 	nodeName, endpoint, caCert, clientCert, clientKey, aesKeyFile string, orchestrator core.Orchestrator,
-	unsafeDetach bool,
+	unsafeDetach bool, helper *nodehelpers.NodeHelper, enableForceDetach bool,
+	iSCSISelfHealingInterval, iSCSIStaleSessionWaitTime time.Duration,
 ) (*Plugin, error) {
 	ctx := GenerateRequestContext(context.Background(), "", ContextSourceInternal)
 
+	msg := "Force detach feature %s"
+	if enableForceDetach {
+		msg = fmt.Sprintf(msg, "enabled.")
+	} else {
+		msg = fmt.Sprintf(msg, "disabled.")
+	}
+	Logc(ctx).Info(msg)
+
 	p := &Plugin{
-		orchestrator: orchestrator,
-		name:         Provisioner,
-		nodeName:     nodeName,
-		version:      tridentconfig.OrchestratorVersion.ShortString(),
-		endpoint:     endpoint,
-		role:         CSINode,
-		unsafeDetach: unsafeDetach,
-		opCache:      sync.Map{},
+		orchestrator:             orchestrator,
+		name:                     Provisioner,
+		nodeName:                 nodeName,
+		version:                  tridentconfig.OrchestratorVersion.ShortString(),
+		endpoint:                 endpoint,
+		role:                     CSINode,
+		nodeHelper:               *helper,
+		enableForceDetach:        enableForceDetach,
+		unsafeDetach:             unsafeDetach,
+		opCache:                  sync.Map{},
+		iSCSISelfHealingInterval: iSCSISelfHealingInterval,
+		iSCSISelfHealingWaitTime: iSCSIStaleSessionWaitTime,
 	}
 
 	if runtime.GOOS == "windows" {
@@ -178,20 +201,24 @@ func NewNodePlugin(
 // identity interfaces.
 func NewAllInOnePlugin(
 	nodeName, endpoint, caCert, clientCert, clientKey, aesKeyFile string, orchestrator core.Orchestrator,
-	helper *helpers.HybridPlugin, unsafeDetach bool,
+	controllerHelper *controllerhelpers.ControllerHelper, nodeHelper *nodehelpers.NodeHelper, unsafeDetach bool,
+	iSCSISelfHealingInterval, iSCSIStaleSessionWaitTime time.Duration,
 ) (*Plugin, error) {
 	ctx := GenerateRequestContext(context.Background(), "", ContextSourceInternal)
 
 	p := &Plugin{
-		orchestrator: orchestrator,
-		name:         Provisioner,
-		nodeName:     nodeName,
-		version:      tridentconfig.OrchestratorVersion.ShortString(),
-		endpoint:     endpoint,
-		role:         CSIAllInOne,
-		unsafeDetach: unsafeDetach,
-		helper:       *helper,
-		opCache:      sync.Map{},
+		orchestrator:             orchestrator,
+		name:                     Provisioner,
+		nodeName:                 nodeName,
+		version:                  tridentconfig.OrchestratorVersion.ShortString(),
+		endpoint:                 endpoint,
+		role:                     CSIAllInOne,
+		unsafeDetach:             unsafeDetach,
+		controllerHelper:         *controllerHelper,
+		nodeHelper:               *nodeHelper,
+		opCache:                  sync.Map{},
+		iSCSISelfHealingInterval: iSCSISelfHealingInterval,
+		iSCSISelfHealingWaitTime: iSCSIStaleSessionWaitTime,
 	}
 
 	// Define controller capabilities
@@ -251,6 +278,7 @@ func (p *Plugin) Activate() error {
 		Logc(ctx).Info("Activating CSI frontend.")
 		if p.role == CSINode || p.role == CSIAllInOne {
 			p.nodeRegisterWithController(ctx, 0) // Retry indefinitely
+			p.startISCSISelfHealingThread(ctx)
 		}
 		p.grpc.Start(p.endpoint, p, p, p)
 	}()
@@ -262,6 +290,10 @@ func (p *Plugin) Deactivate() error {
 
 	Logc(ctx).Info("Deactivating CSI frontend.")
 	p.grpc.GracefulStop()
+
+	// Stop iSCSI self-healing thread
+	p.stopISCSISelfHealingThread(ctx)
+
 	return nil
 }
 
@@ -317,6 +349,12 @@ func (p *Plugin) getCSIErrorForOrchestratorError(err error) error {
 		return status.Error(codes.OutOfRange, errPtr.Error())
 	} else if utils.IsFoundError(err) {
 		return status.Error(codes.AlreadyExists, err.Error())
+	} else if utils.IsVolumeCreatingError(err) {
+		return status.Error(codes.DeadlineExceeded, err.Error())
+	} else if utils.IsVolumeDeletingError(err) {
+		return status.Error(codes.DeadlineExceeded, err.Error())
+	} else if ok, errPtr := utils.HasResourceExhaustedError(err); ok && errPtr != nil {
+		return status.Error(codes.ResourceExhausted, err.Error())
 	} else {
 		return status.Error(codes.Unknown, err.Error())
 	}
@@ -339,4 +377,56 @@ func ReadAESKey(ctx context.Context, aesKeyFile string) ([]byte, error) {
 
 func (p *Plugin) IsReady() bool {
 	return p.nodeIsRegistered
+}
+
+// startISCSISelfHealingThread starts the iSCSI self-healing thread to heal faulty sessions.
+func (p *Plugin) startISCSISelfHealingThread(ctx context.Context) {
+	// provision to disable the iSCSI self-healing feature
+	if p.iSCSISelfHealingInterval <= 0 {
+		Logc(ctx).Debugf("Iscsi self-healing is disabled.")
+		return
+	}
+	if p.iSCSISelfHealingWaitTime < p.iSCSISelfHealingInterval {
+		// Stale session wait time is not advised to be smaller than self-heal interval
+		p.iSCSISelfHealingWaitTime = time.Duration(1.5 * float64(p.iSCSISelfHealingInterval))
+	}
+
+	Logc(ctx).WithFields(log.Fields{
+		"iSCSISelfHealingInterval": p.iSCSISelfHealingInterval,
+		"iSCSISelfHealingWaitTime": p.iSCSISelfHealingWaitTime,
+	}).Debugf(
+		"iSCSI self-healing is enabled.")
+	p.iSCSISelfHealingTicker = time.NewTicker(p.iSCSISelfHealingInterval)
+	p.iSCSISelfHealingChannel = make(chan struct{})
+
+	p.populatePublishedISCSISessions(ctx)
+
+	go func() {
+		for {
+			select {
+			case tick := <-p.iSCSISelfHealingTicker.C:
+				Logc(ctx).WithField("tick", tick).Debug("ISCSI self-healing is running.")
+				// perform self healing here
+				p.performISCSISelfHealing(ctx)
+			case <-p.iSCSISelfHealingChannel:
+				Logc(ctx).Debugf("ISCSI self-healing stopped.")
+				return
+			}
+		}
+	}()
+
+	return
+}
+
+// stopISCSISelfHealingThread stops the iSCSI self-healing thread.
+func (p *Plugin) stopISCSISelfHealingThread(ctx context.Context) {
+	if p.iSCSISelfHealingTicker != nil {
+		p.iSCSISelfHealingTicker.Stop()
+	}
+
+	if p.iSCSISelfHealingChannel != nil {
+		close(p.iSCSISelfHealingChannel)
+	}
+
+	return
 }

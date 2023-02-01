@@ -242,6 +242,9 @@ rules:
       - use
     resourceNames:
       - tridentpods
+      - trident-controller
+      - trident-node-linux
+      - trident-node-windows
   # Now Operator specific permissions
   - apiGroups:
       - ""
@@ -265,16 +268,29 @@ rules:
       - apps
     resources:
       - deployments
-      - daemonsets
       - statefulsets
     verbs:
       - delete
       - update
       - patch
     resourceNames:
+      - trident
+      - trident-csi
+      - trident-controller
+  - apiGroups:
+      - apps
+    resources:
+      - daemonsets
+    verbs:
+      - delete
+      - update
+      - patch
+    resourceNames:
+      - trident
       - trident-csi
       - trident-csi-windows
-      - trident
+      - trident-node-linux
+      - trident-node-windows
   - apiGroups:
       - ""
     resources:
@@ -315,6 +331,8 @@ rules:
       - authorization.openshift.io
       - rbac.authorization.k8s.io
     resources:
+      - roles
+      - rolebindings
       - clusterroles
       - clusterrolebindings
     verbs:
@@ -324,6 +342,8 @@ rules:
       - authorization.openshift.io
       - rbac.authorization.k8s.io
     resources:
+      - roles
+      - rolebindings
       - clusterroles
       - clusterrolebindings
     verbs:
@@ -349,6 +369,9 @@ rules:
       - podsecuritypolicies
     resourceNames:
       - tridentpods
+      - trident-controller
+      - trident-node-linux
+      - trident-node-windows
     verbs:
       - delete
       - update
@@ -430,11 +453,11 @@ spec:
                   fieldPath: metadata.name
             - name: OPERATOR_NAME
               value: trident-operator
-          image: docker.io/netapp/trident-operator:22.10.0
+          image: docker.io/scaleoutsean/trident-arm64:v23.01
           imagePullPolicy: IfNotPresent
           name: trident-operator
       nodeSelector:
-        kubernetes.io/arch: amd64
+        kubernetes.io/arch: arm64
         kubernetes.io/os: linux
       serviceAccountName: trident-operator
 ---

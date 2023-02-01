@@ -20,6 +20,14 @@ func GetNamespaceYAML(namespace string) string {
 	return strings.ReplaceAll(namespaceYAMLTemplate, "{NAMESPACE}", namespace)
 }
 
+func isControllerRBACResource(labels map[string]string) bool {
+	return strings.HasPrefix(labels[TridentAppLabelKey], "controller")
+}
+
+func isNodeRBACResource(labels map[string]string) bool {
+	return strings.HasPrefix(labels[TridentAppLabelKey], "node")
+}
+
 const namespaceYAMLTemplate = `---
 apiVersion: v1
 kind: Namespace
@@ -73,7 +81,7 @@ func GetClusterRoleYAML(
 	var clusterRoleYAML string
 
 	if csi {
-		clusterRoleYAML = clusterRoleCSIYAMLTemplate
+		clusterRoleYAML = controllerClusterRoleCSIYAMLTemplate
 	} else {
 		clusterRoleYAML = clusterRoleYAMLTemplate
 	}
@@ -137,7 +145,11 @@ rules:
       - tridentpods
 `
 
-const clusterRoleCSIYAMLTemplate = `---
+// Specific permissions for sidecars
+// csi-resizer needs 'list' for pods
+// csi-snapshotter needs 'watch' for volumesnapshotclasses
+// trident-autosupport needs 'get' for namespace resource cluster-wide
+const controllerClusterRoleCSIYAMLTemplate = `---
 kind: ClusterRole
 apiVersion: {API_VERSION}
 metadata:
@@ -149,8 +161,11 @@ rules:
     resources: ["namespaces"]
     verbs: ["get", "list"]
   - apiGroups: [""]
-    resources: ["persistentvolumes", "persistentvolumeclaims"]
+    resources: ["persistentvolumes"]
     verbs: ["get", "list", "watch", "create", "delete", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
   - apiGroups: [""]
     resources: ["persistentvolumeclaims/status"]
     verbs: ["update", "patch"]
@@ -161,20 +176,14 @@ rules:
     resources: ["events"]
     verbs: ["get", "list", "watch", "create", "update", "patch"]
   - apiGroups: [""]
-    resources: ["secrets"]
-    verbs: ["get", "list", "watch", "create", "delete", "update", "patch"]
-  - apiGroups: [""]
     resources: ["resourcequotas"]
-    verbs: ["get", "list", "watch", "create", "delete", "update", "patch"]
+    verbs: ["get", "list", "delete", "patch"]
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "list", "watch", "create", "delete", "update", "patch"]
-  - apiGroups: [""]
-    resources: ["pods/log"]
     verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources: ["nodes"]
-    verbs: ["get", "list", "watch", "update"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["storage.k8s.io"]
     resources: ["volumeattachments"]
     verbs: ["get", "list", "watch", "update", "patch"]
@@ -183,19 +192,16 @@ rules:
     verbs: ["update", "patch"]
   - apiGroups: ["snapshot.storage.k8s.io"]
     resources: ["volumesnapshots", "volumesnapshotclasses"]
-    verbs: ["get", "list", "watch", "update", "patch"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["snapshot.storage.k8s.io"]
     resources: ["volumesnapshots/status", "volumesnapshotcontents/status"]
     verbs: ["update", "patch"]
   - apiGroups: ["snapshot.storage.k8s.io"]
     resources: ["volumesnapshotcontents"]
-    verbs: ["get", "list", "watch", "create", "delete", "update", "patch"]
+    verbs: ["get", "list", "watch", "update", "patch"]
   - apiGroups: ["storage.k8s.io"]
-    resources: ["csidrivers", "csinodes"]
-    verbs: ["get", "list", "watch", "create", "delete", "update", "patch"]
-  - apiGroups: ["apiextensions.k8s.io"]
-    resources: ["customresourcedefinitions"]
-    verbs: ["get", "list", "watch", "create", "delete", "update", "patch"]
+    resources: ["csinodes"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["trident.netapp.io"]
     resources: ["tridentversions", "tridentbackends", "tridentstorageclasses", "tridentvolumes","tridentnodes",
 "tridenttransactions", "tridentsnapshots", "tridentbackendconfigs", "tridentbackendconfigs/status",
@@ -206,7 +212,89 @@ rules:
     resources: ["podsecuritypolicies"]
     verbs: ["use"]
     resourceNames:
-      - tridentpods
+      - {CLUSTER_ROLE_NAME}
+`
+
+func GetRoleYAML(flavor OrchestratorFlavor, namespace, roleName string, labels, controllingCRDetails map[string]string,
+	csi bool,
+) string {
+	var roleYAML string
+
+	if isControllerRBACResource(labels) {
+		roleYAML = controllerRoleCSIYAMLTemplate
+	} else {
+		roleYAML = nodeRoleCSIYAMLTemplate
+	}
+
+	roleYAML = strings.ReplaceAll(roleYAML, "{ROLE_NAME}", roleName)
+	roleYAML = strings.ReplaceAll(roleYAML, "{NAMESPACE}", namespace)
+	roleYAML = replaceMultilineYAMLTag(roleYAML, "LABELS", constructLabels(labels))
+	roleYAML = replaceMultilineYAMLTag(roleYAML, "OWNER_REF", constructOwnerRef(controllingCRDetails))
+
+	return roleYAML
+}
+
+// trident-autosupport needs 'get' for pod/log resources in the 'trident' namespace
+const controllerRoleCSIYAMLTemplate = `---
+kind: Role
+apiVersion: "rbac.authorization.k8s.io/v1"
+metadata:
+  namespace: {NAMESPACE}
+  name: {ROLE_NAME}
+  {LABELS}
+  {OWNER_REF}
+rules:
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch", "create", "delete", "update", "patch"]
+`
+
+const nodeRoleCSIYAMLTemplate = `---
+kind: Role
+apiVersion: "rbac.authorization.k8s.io/v1"
+metadata:
+  namespace: {NAMESPACE}
+  name: {ROLE_NAME}
+  {LABELS}
+  {OWNER_REF}
+rules:
+  - apiGroups: ["policy"]
+    resources: ["podsecuritypolicies"]
+    verbs: ["use"]
+    resourceNames:
+      - {ROLE_NAME}
+`
+
+func GetRoleBindingYAML(flavor OrchestratorFlavor, namespace, name string,
+	labels, controllingCRDetails map[string]string, csi bool,
+) string {
+	rbYAML := roleBindingKubernetesV1YAMLTemplate
+	rbYAML = strings.ReplaceAll(rbYAML, "{NAMESPACE}", namespace)
+	rbYAML = strings.ReplaceAll(rbYAML, "{NAME}", name)
+	rbYAML = replaceMultilineYAMLTag(rbYAML, "LABELS", constructLabels(labels))
+	rbYAML = replaceMultilineYAMLTag(rbYAML, "OWNER_REF", constructOwnerRef(controllingCRDetails))
+	return rbYAML
+}
+
+const roleBindingKubernetesV1YAMLTemplate = `---
+kind: RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: {NAME}
+  namespace: {NAMESPACE}
+  {LABELS}
+  {OWNER_REF}
+subjects:
+  - kind: ServiceAccount
+    name: {NAME}
+    apiGroup: ""
+roleRef:
+  kind: Role
+  name: {NAME}
+  apiGroup: rbac.authorization.k8s.io
 `
 
 func GetClusterRoleBindingYAML(
@@ -334,7 +422,7 @@ func GetCSIDeploymentYAML(args *DeploymentYAMLArguments) string {
 
 	csiSnapshotterVersion := "v3.0.3"
 	if args.SnapshotCRDVersion == "v1" {
-		csiSnapshotterVersion = "v6.1.0"
+		csiSnapshotterVersion = "v6.2.1"
 	}
 
 	if args.ImageRegistry == "" {
@@ -382,6 +470,7 @@ func GetCSIDeploymentYAML(args *DeploymentYAMLArguments) string {
 	deploymentYAML = strings.ReplaceAll(deploymentYAML, "{LABEL_APP}", args.Labels[TridentAppLabelKey])
 	deploymentYAML = strings.ReplaceAll(deploymentYAML, "{LOG_LEVEL}", logLevel)
 	deploymentYAML = strings.ReplaceAll(deploymentYAML, "{LOG_FORMAT}", args.LogFormat)
+	deploymentYAML = strings.ReplaceAll(deploymentYAML, "{DISABLE_AUDIT_LOG}", strconv.FormatBool(args.DisableAuditLog))
 	deploymentYAML = strings.ReplaceAll(deploymentYAML, "{IP_LOCALHOST}", ipLocalhost)
 	deploymentYAML = strings.ReplaceAll(deploymentYAML, "{AUTOSUPPORT_IMAGE}", args.AutosupportImage)
 	deploymentYAML = strings.ReplaceAll(deploymentYAML, "{AUTOSUPPORT_PROXY}", autosupportProxyLine)
@@ -393,6 +482,7 @@ func GetCSIDeploymentYAML(args *DeploymentYAMLArguments) string {
 	deploymentYAML = strings.ReplaceAll(deploymentYAML, "{PROVISIONER_FEATURE_GATES}", provisionerFeatureGates)
 	deploymentYAML = strings.ReplaceAll(deploymentYAML, "{HTTP_REQUEST_TIMEOUT}", args.HTTPRequestTimeout)
 	deploymentYAML = strings.ReplaceAll(deploymentYAML, "{SERVICE_ACCOUNT}", args.ServiceAccountName)
+	deploymentYAML = strings.ReplaceAll(deploymentYAML, "{IMAGE_PULL_POLICY}", args.ImagePullPolicy)
 	deploymentYAML = replaceMultilineYAMLTag(deploymentYAML, "LABELS", constructLabels(args.Labels))
 	deploymentYAML = replaceMultilineYAMLTag(deploymentYAML, "OWNER_REF", constructOwnerRef(args.ControllingCRDetails))
 	deploymentYAML = replaceMultilineYAMLTag(deploymentYAML, "IMAGE_PULL_SECRETS",
@@ -426,6 +516,7 @@ spec:
       containers:
       - name: trident-main
         image: {TRIDENT_IMAGE}
+        imagePullPolicy: {IMAGE_PULL_POLICY}
         ports:
         - containerPort: 8443
         - containerPort: 8001
@@ -440,6 +531,7 @@ spec:
         - "--csi_endpoint=$(CSI_ENDPOINT)"
         - "--csi_role=controller"
         - "--log_format={LOG_FORMAT}"
+        - "--disable_audit_log={DISABLE_AUDIT_LOG}"
         - "--address={IP_LOCALHOST}"
         - "--http_request_timeout={HTTP_REQUEST_TIMEOUT}"
         - "--metrics"
@@ -473,6 +565,7 @@ spec:
           readOnly: true
       - name: trident-autosupport
         image: {AUTOSUPPORT_IMAGE}
+        imagePullPolicy: {IMAGE_PULL_POLICY}
         command:
         - /usr/local/bin/trident-autosupport
         args:
@@ -491,7 +584,8 @@ spec:
         - name: asup-dir
           mountPath: /asup
       - name: csi-provisioner
-        image: {CSI_SIDECAR_REGISTRY}/csi-provisioner:v3.3.0
+        image: {CSI_SIDECAR_REGISTRY}/csi-provisioner:v3.4.0
+        imagePullPolicy: {IMAGE_PULL_POLICY}
         args:
         - "--v={LOG_LEVEL}"
         - "--timeout=600s"
@@ -506,7 +600,8 @@ spec:
         - name: socket-dir
           mountPath: /var/lib/csi/sockets/pluginproxy/
       - name: csi-attacher
-        image: {CSI_SIDECAR_REGISTRY}/csi-attacher:v4.0.0
+        image: {CSI_SIDECAR_REGISTRY}/csi-attacher:v4.1.0
+        imagePullPolicy: {IMAGE_PULL_POLICY}
         args:
         - "--v={LOG_LEVEL}"
         - "--timeout=60s"
@@ -519,7 +614,8 @@ spec:
         - name: socket-dir
           mountPath: /var/lib/csi/sockets/pluginproxy/
       - name: csi-resizer
-        image: {CSI_SIDECAR_REGISTRY}/csi-resizer:v1.6.0
+        image: {CSI_SIDECAR_REGISTRY}/csi-resizer:v1.7.0
+        imagePullPolicy: {IMAGE_PULL_POLICY}
         args:
         - "--v={LOG_LEVEL}"
         - "--timeout=300s"
@@ -532,6 +628,7 @@ spec:
           mountPath: /var/lib/csi/sockets/pluginproxy/
       - name: csi-snapshotter
         image: {CSI_SIDECAR_REGISTRY}/csi-snapshotter:{CSI_SNAPSHOTTER_VERSION}
+        imagePullPolicy: {IMAGE_PULL_POLICY}
         args:
         - "--v={LOG_LEVEL}"
         - "--timeout=300s"
@@ -609,9 +706,11 @@ func GetCSIDaemonSetYAMLWindows(args *DaemonsetYAMLArguments) string {
 	daemonSetYAML = strings.ReplaceAll(daemonSetYAML, "{DEBUG}", debugLine)
 	daemonSetYAML = strings.ReplaceAll(daemonSetYAML, "{LOG_LEVEL}", logLevel)
 	daemonSetYAML = strings.ReplaceAll(daemonSetYAML, "{LOG_FORMAT}", args.LogFormat)
+	daemonSetYAML = strings.ReplaceAll(daemonSetYAML, "{DISABLE_AUDIT_LOG}", strconv.FormatBool(args.DisableAuditLog))
 	daemonSetYAML = strings.ReplaceAll(daemonSetYAML, "{PROBE_PORT}", args.ProbePort)
 	daemonSetYAML = strings.ReplaceAll(daemonSetYAML, "{HTTP_REQUEST_TIMEOUT}", args.HTTPRequestTimeout)
 	daemonSetYAML = strings.ReplaceAll(daemonSetYAML, "{SERVICE_ACCOUNT}", args.ServiceAccountName)
+	daemonSetYAML = strings.ReplaceAll(daemonSetYAML, "{IMAGE_PULL_POLICY}", args.ImagePullPolicy)
 	daemonSetYAML = replaceMultilineYAMLTag(daemonSetYAML, "NODE_SELECTOR", constructNodeSelector(args.NodeSelector))
 	daemonSetYAML = replaceMultilineYAMLTag(daemonSetYAML, "NODE_TOLERATIONS", constructTolerations(tolerations))
 	daemonSetYAML = replaceMultilineYAMLTag(daemonSetYAML, "LABELS", constructLabels(args.Labels))
@@ -658,12 +757,15 @@ func GetCSIDaemonSetYAMLLinux(args *DaemonsetYAMLArguments) string {
 	daemonSetYAML = strings.ReplaceAll(daemonSetYAML, "{CSI_SIDECAR_REGISTRY}", args.ImageRegistry)
 	daemonSetYAML = strings.ReplaceAll(daemonSetYAML, "{KUBELET_DIR}", kubeletDir)
 	daemonSetYAML = strings.ReplaceAll(daemonSetYAML, "{LABEL_APP}", args.Labels[TridentAppLabelKey])
+	daemonSetYAML = strings.ReplaceAll(daemonSetYAML, "{FORCE_DETACH_BOOL}", strconv.FormatBool(args.EnableForceDetach))
 	daemonSetYAML = strings.ReplaceAll(daemonSetYAML, "{DEBUG}", debugLine)
 	daemonSetYAML = strings.ReplaceAll(daemonSetYAML, "{LOG_LEVEL}", logLevel)
 	daemonSetYAML = strings.ReplaceAll(daemonSetYAML, "{LOG_FORMAT}", args.LogFormat)
+	daemonSetYAML = strings.ReplaceAll(daemonSetYAML, "{DISABLE_AUDIT_LOG}", strconv.FormatBool(args.DisableAuditLog))
 	daemonSetYAML = strings.ReplaceAll(daemonSetYAML, "{PROBE_PORT}", args.ProbePort)
 	daemonSetYAML = strings.ReplaceAll(daemonSetYAML, "{HTTP_REQUEST_TIMEOUT}", args.HTTPRequestTimeout)
 	daemonSetYAML = strings.ReplaceAll(daemonSetYAML, "{SERVICE_ACCOUNT}", args.ServiceAccountName)
+	daemonSetYAML = strings.ReplaceAll(daemonSetYAML, "{IMAGE_PULL_POLICY}", args.ImagePullPolicy)
 	daemonSetYAML = replaceMultilineYAMLTag(daemonSetYAML, "NODE_SELECTOR", constructNodeSelector(args.NodeSelector))
 	daemonSetYAML = replaceMultilineYAMLTag(daemonSetYAML, "NODE_TOLERATIONS", constructTolerations(tolerations))
 	daemonSetYAML = replaceMultilineYAMLTag(daemonSetYAML, "LABELS", constructLabels(args.Labels))
@@ -702,18 +804,22 @@ spec:
           privileged: true
           allowPrivilegeEscalation: true
         image: {TRIDENT_IMAGE}
+        imagePullPolicy: {IMAGE_PULL_POLICY}
         command:
         - /trident_orchestrator
         args:
         - "--no_persistence"
+        - "--k8s_pod"
         - "--rest=false"
         - "--csi_node_name=$(KUBE_NODE_NAME)"
         - "--csi_endpoint=$(CSI_ENDPOINT)"
         - "--csi_role=node"
         - "--log_format={LOG_FORMAT}"
+        - "--disable_audit_log={DISABLE_AUDIT_LOG}"
         - "--http_request_timeout={HTTP_REQUEST_TIMEOUT}"
         - "--https_rest"
         - "--https_port={PROBE_PORT}"
+        - "--enable_force_detach={FORCE_DETACH_BOOL}"
         {DEBUG}
         startupProbe:
           httpGet:
@@ -745,6 +851,8 @@ spec:
             fieldRef:
               apiVersion: v1
               fieldPath: spec.nodeName
+        - name: KUBELET_DIR
+          value: {KUBELET_DIR}
         - name: CSI_ENDPOINT
           value: unix://plugin/csi.sock
         - name: PATH
@@ -772,7 +880,8 @@ spec:
           mountPath: /certs
           readOnly: true
       - name: driver-registrar
-        image: {CSI_SIDECAR_REGISTRY}/csi-node-driver-registrar:v2.5.1
+        image: {CSI_SIDECAR_REGISTRY}/csi-node-driver-registrar:v2.7.0
+        imagePullPolicy: {IMAGE_PULL_POLICY}
         args:
         - "--v={LOG_LEVEL}"
         - "--csi-address=$(ADDRESS)"
@@ -855,20 +964,27 @@ spec:
       labels:
         app: {LABEL_APP}
     spec:
+      securityContext:
+        windowsOptions:
+          hostProcess: false
+          runAsUserName: "ContainerAdministrator"
       priorityClassName: system-node-critical
       serviceAccount: {SERVICE_ACCOUNT}
       containers:
       - name: trident-main
+        imagePullPolicy: {IMAGE_PULL_POLICY}
         image: {TRIDENT_IMAGE}
         command:
         - trident_orchestrator.exe
         args:
         - "--no_persistence"
+        - "--k8s_pod"
         - "--rest=false"
         - "--csi_node_name=$(KUBE_NODE_NAME)"
         - "--csi_endpoint=$(CSI_ENDPOINT)"
         - "--csi_role=node"
         - "--log_format={LOG_FORMAT}"
+        - "--disable_audit_log={DISABLE_AUDIT_LOG}"
         - "--http_request_timeout={HTTP_REQUEST_TIMEOUT}"
         - "--https_rest"
         - "--https_port={PROBE_PORT}"
@@ -911,6 +1027,8 @@ spec:
               fieldPath: spec.nodeName
         - name: CSI_ENDPOINT
           value: unix:///csi/csi.sock
+        - name: KUBELET_DIR
+          value: {KUBELET_DIR}
         volumeMounts:
         - name: trident-tracking-dir
           mountPath: C:\var\lib\trident\tracking
@@ -918,7 +1036,7 @@ spec:
           mountPath: /certs
           readOnly: true
         - name: kubelet-dir
-          mountPath: C:\var\lib\kubelet
+          mountPath: {KUBELET_DIR}
         - name: plugin-dir
           mountPath: C:\csi
         - name: csi-proxy-fs-pipe-v1
@@ -941,7 +1059,8 @@ spec:
             cpu: 10m
             memory: 20Mi
       - name: node-driver-registrar
-        image: {CSI_SIDECAR_REGISTRY}/csi-node-driver-registrar:v2.5.1
+        image: {CSI_SIDECAR_REGISTRY}/csi-node-driver-registrar:v2.7.0
+        imagePullPolicy: {IMAGE_PULL_POLICY}
         args:
         - --v=2
         - --csi-address=$(CSI_ENDPOINT)
@@ -958,14 +1077,14 @@ spec:
         - name: CSI_ENDPOINT
           value: unix:///csi/csi.sock
         - name: DRIVER_REG_SOCK_PATH
-          value: C:\var\lib\kubelet\plugins\csi.trident.netapp.io\csi.sock
+          value: {KUBELET_DIR}\plugins\csi.trident.netapp.io\csi.sock
         - name: KUBE_NODE_NAME
           valueFrom:
             fieldRef:
               fieldPath: spec.nodeName
         volumeMounts:
         - name: kubelet-dir
-          mountPath: C:\var\lib\kubelet
+          mountPath: {KUBELET_DIR}
         - name: plugin-dir
           mountPath: C:\csi
         - name: registration-dir
@@ -1031,20 +1150,20 @@ spec:
             path: \\.\pipe\csi-proxy-smb-v1beta1
         - name: registration-dir
           hostPath:
-            path: C:\var\lib\kubelet\plugins_registry\
+            path: {KUBELET_DIR}\plugins_registry\
             type: Directory
         - name: kubelet-dir
           hostPath:
-            path: C:\var\lib\kubelet\
+            path: {KUBELET_DIR}\
             type: Directory
         - name: plugin-dir
           hostPath:
-            path: C:\var\lib\kubelet\plugins\csi.trident.netapp.io\
+            path: {KUBELET_DIR}\plugins\csi.trident.netapp.io\
             type: DirectoryOrCreate
 `
 
 func GetTridentVersionPodYAML(
-	name, tridentImage, serviceAccountName string, imagePullSecrets []string, labels,
+	name, tridentImage, serviceAccountName, imagePullPolicy string, imagePullSecrets []string, labels,
 	controllingCRDetails map[string]string,
 ) string {
 	versionPodYAML := strings.ReplaceAll(tridentVersionPodYAML, "{NAME}", name)
@@ -1054,6 +1173,7 @@ func GetTridentVersionPodYAML(
 	versionPodYAML = replaceMultilineYAMLTag(versionPodYAML, "OWNER_REF", constructOwnerRef(controllingCRDetails))
 	versionPodYAML = replaceMultilineYAMLTag(versionPodYAML, "IMAGE_PULL_SECRETS",
 		constructImagePullSecrets(imagePullSecrets))
+	versionPodYAML = strings.ReplaceAll(versionPodYAML, "{IMAGE_PULL_POLICY}", imagePullPolicy)
 
 	return versionPodYAML
 }
@@ -1070,7 +1190,7 @@ spec:
   restartPolicy: Never
   containers:
   - name: trident-main
-    imagePullPolicy: IfNotPresent
+    imagePullPolicy: {IMAGE_PULL_POLICY}
     image: {TRIDENT_IMAGE}
     command: ["tridentctl"]
     args: ["pause"]
@@ -1080,10 +1200,11 @@ spec:
     beta.kubernetes.io/arch: amd64
 `
 
-func GetOpenShiftSCCYAML(sccName, user, namespace string, labels, controllingCRDetails map[string]string) string {
-	sccYAML := openShiftPrivilegedSCCYAML
-	if !strings.Contains(labels[TridentAppLabelKey], "csi") && user != "trident-installer" {
-		sccYAML = openShiftUnprivilegedSCCYAML
+func GetOpenShiftSCCYAML(sccName, user, namespace string, labels, controllingCRDetails map[string]string, privileged bool) string {
+	sccYAML := openShiftUnprivilegedSCCYAML
+	// Only linux node pod needs an privileged SCC (i.e. privileged set to true)
+	if privileged {
+		sccYAML = openShiftPrivilegedSCCYAML
 	}
 	sccYAML = strings.ReplaceAll(sccYAML, "{SCC}", sccName)
 	sccYAML = strings.ReplaceAll(sccYAML, "{NAMESPACE}", namespace)
@@ -1988,6 +2109,7 @@ metadata:
   {OWNER_REF}
 spec:
   privileged: false
+  allowPrivilegeEscalation: false
   seLinux:
     rule: RunAsAny
   supplementalGroups:

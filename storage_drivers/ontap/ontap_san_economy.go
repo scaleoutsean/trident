@@ -455,10 +455,7 @@ func (d *SANEconomyStorageDriver) Create(
 	}
 
 	// Get options
-	opts, err := d.GetVolumeOpts(ctx, volConfig, volAttributes)
-	if err != nil {
-		return err
-	}
+	opts := d.GetVolumeOpts(ctx, volConfig, volAttributes)
 
 	// Get Flexvol options with default fallback values
 	// see also: ontap_common.go#PopulateConfigurationDefaults
@@ -877,7 +874,7 @@ func (d *SANEconomyStorageDriver) Destroy(ctx context.Context, volConfig *storag
 		}
 		if lunID >= 0 {
 			// Inform the host about the device removal
-			if err := utils.PrepareDeviceForRemoval(ctx, lunID, iSCSINodeName, true, false); err != nil {
+			if _, err := utils.PrepareDeviceForRemoval(ctx, lunID, iSCSINodeName, true, false); err != nil {
 				Logc(ctx).Error(err)
 			}
 		}
@@ -1318,7 +1315,8 @@ func (d *SANEconomyStorageDriver) Get(ctx context.Context, name string) error {
 // LUN or it creates a new Flexvol with the needed attributes.  The name of the matching volume is returned,
 // as is a boolean indicating whether the volume was newly created to satisfy this request.
 func (d *SANEconomyStorageDriver) ensureFlexvolForLUN(
-	ctx context.Context, volAttrs *api.Volume, sizeBytes uint64, opts map[string]string, config drivers.OntapStorageDriverConfig,
+	ctx context.Context, volAttrs *api.Volume, sizeBytes uint64, opts map[string]string,
+	config drivers.OntapStorageDriverConfig,
 	storagePool storage.Pool, ignoredVols map[string]struct{},
 ) (string, bool, error) {
 	shouldLimitVolumeSize, flexvolSizeLimit, checkVolumeSizeLimitsError := drivers.CheckVolumeSizeLimits(
@@ -1576,8 +1574,8 @@ func (d *SANEconomyStorageDriver) getStoragePoolAttributes() map[string]sa.Offer
 
 func (d *SANEconomyStorageDriver) GetVolumeOpts(
 	ctx context.Context, volConfig *storage.VolumeConfig, requests map[string]sa.Request,
-) (map[string]string, error) {
-	return getVolumeOptsCommon(ctx, volConfig, requests), nil
+) map[string]string {
+	return getVolumeOptsCommon(ctx, volConfig, requests)
 }
 
 func (d *SANEconomyStorageDriver) GetInternalVolumeName(_ context.Context, name string) string {
@@ -1774,7 +1772,7 @@ func (d *SANEconomyStorageDriver) GetUpdateType(_ context.Context, driverOrig st
 	}
 
 	if d.Config.DataLIF != dOrig.Config.DataLIF {
-		bitmap.Add(storage.VolumeAccessInfoChange)
+		bitmap.Add(storage.InvalidVolumeAccessInfoChange)
 	}
 
 	if d.Config.Password != dOrig.Config.Password {
@@ -1899,16 +1897,6 @@ func (d *SANEconomyStorageDriver) Resize(ctx context.Context, volConfig *storage
 
 	if flexvolSize < totalLunSize {
 		return fmt.Errorf("requested size %d is less than existing volume size %d", flexvolSize, totalLunSize)
-	}
-
-	if volConfig.LUKSEncryption != "" {
-		luks, err := strconv.ParseBool(volConfig.LUKSEncryption)
-		if err != nil {
-			return fmt.Errorf("could not parse LUKSEncryption from volume config into a boolean, got %v", luks)
-		}
-		if luks {
-			return fmt.Errorf("cannot resize LUKS encrypted volumes")
-		}
 	}
 
 	if aggrLimitsErr := checkAggregateLimitsForFlexvol(

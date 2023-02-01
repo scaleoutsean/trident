@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 	"go.uber.org/multierr"
@@ -52,6 +53,12 @@ const (
 
 	// NAS protocols
 	SMB = "smb"
+
+	// Path separator
+	WindowsPathSeparator = `\`
+	UnixPathSeparator    = "/"
+
+	deviceOperationsTimeout = 5 * time.Second
 )
 
 var (
@@ -989,4 +996,9 @@ func GetPrintableBoolPtrValue(bPtr *bool) string {
 		return "false"
 	}
 	return "none"
+}
+
+// Ptr converts any value into a pointer to that value.
+func Ptr[T any](v T) *T {
+	return &v
 }

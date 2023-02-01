@@ -94,9 +94,28 @@ func GetDeviceFilePath(ctx context.Context, path, volumeId string) (string, erro
 }
 
 // GetUnmountPath is a dummy added for compilation
-func GetUnmountPath(ctx context.Context, resourcePath, arg string) (string, error) {
+func GetUnmountPath(ctx context.Context, trackingInfo *VolumeTrackingInfo) (string, error) {
 	Logc(ctx).Debug(">>>> filesystem_linux.GetUnmountPath")
 	defer Logc(ctx).Debug("<<<< filesystem_linux.GetUnmountPath")
 
 	return "", UnsupportedError("GetUnmountPath is not supported for linux")
+}
+
+// generateAnonymousMemFile uses linux syscall memfd_create to create an anonymous, temporary, in-memory file
+// with the specified name and contents
+func generateAnonymousMemFile(tempFileName, content string) (int, error) {
+	fd, err := unix.MemfdCreate(tempFileName, 0)
+	if err != nil {
+		return -1, fmt.Errorf("failed to create anonymous file; %v", err)
+	}
+	_, err = unix.Write(fd, []byte(content))
+	if err != nil {
+		return fd, fmt.Errorf("failed to write anonymous file; %v", err)
+	}
+	// Rewind back to the beginning
+	_, err = unix.Seek(fd, 0, 0)
+	if err != nil {
+		return fd, fmt.Errorf("failed to rewind anonymous file; %v", err)
+	}
+	return fd, nil
 }

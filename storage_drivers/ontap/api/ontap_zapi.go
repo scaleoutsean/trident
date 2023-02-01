@@ -192,7 +192,7 @@ const (
 
 // Indicate the minimum Ontapi version for each feature here
 var features = map[Feature]*utils.Version{
-	MinimumONTAPIVersion:      utils.MustParseSemantic("1.130.0"), // cDOT 9.3.0
+	MinimumONTAPIVersion:      utils.MustParseSemantic("1.150.0"), // cDOT 9.5.0
 	NetAppFlexGroups:          utils.MustParseSemantic("1.120.0"), // cDOT 9.2.0
 	NetAppFlexGroupsClone:     utils.MustParseSemantic("1.170.0"), // cDOT 9.7.0
 	NetAppFabricPoolFlexVol:   utils.MustParseSemantic("1.120.0"), // cDOT 9.2.0
@@ -205,7 +205,7 @@ var features = map[Feature]*utils.Version{
 
 // Indicate the minimum Ontap version for each feature here (non-API specific)
 var featuresByVersion = map[Feature]*utils.Version{
-	MinimumONTAPIVersion:      utils.MustParseSemantic("9.3.0"),
+	MinimumONTAPIVersion:      utils.MustParseSemantic("9.5.0"),
 	NetAppFlexGroups:          utils.MustParseSemantic("9.2.0"),
 	NetAppFlexGroupsClone:     utils.MustParseSemantic("9.7.0"),
 	NetAppFabricPoolFlexVol:   utils.MustParseSemantic("9.2.0"),
@@ -780,13 +780,16 @@ func (c Client) FlexGroupCreate(
 		SetSize(size).
 		SetSnapshotPolicy(snapshotPolicy).
 		SetSpaceReserve(spaceReserve).
-		SetUnixPermissions(unixPermissions).
 		SetExportPolicy(exportPolicy).
 		SetVolumeSecurityStyle(securityStyle).
 		SetAggrList(aggrList).
 		SetJunctionPath(junctionPath).
 		SetVolumeComment(comment)
 
+	// Set Unix permission for NFS volume only.
+	if unixPermissions != "" {
+		request.SetUnixPermissions(unixPermissions)
+	}
 	// For encrypt == nil - we don't explicitely set the encrypt argument.
 	// If destination aggregate is NAE enabled, new volume will be aggregate encrypted
 	// else it will be volume encrypted as per Ontap's default behaviour.
@@ -977,7 +980,11 @@ func (c Client) FlexGroupModifyUnixPermissions(
 	ctx context.Context, volumeName, unixPermissions string,
 ) (*azgo.VolumeModifyIterAsyncResponse, error) {
 	volAttr := &azgo.VolumeModifyIterAsyncRequestAttributes{}
-	volSecurityUnixAttrs := azgo.NewVolumeSecurityUnixAttributesType().SetPermissions(unixPermissions)
+	volSecurityUnixAttrs := azgo.NewVolumeSecurityUnixAttributesType()
+	// Set Unix permission for NFS volume only.
+	if unixPermissions != "" {
+		volSecurityUnixAttrs.SetPermissions(unixPermissions)
+	}
 	volSecurityAttrs := azgo.NewVolumeSecurityAttributesType().SetVolumeSecurityUnixAttributes(*volSecurityUnixAttrs)
 	securityAttributes := azgo.NewVolumeAttributesType().SetVolumeSecurityAttributes(*volSecurityAttrs)
 	volAttr.SetVolumeAttributes(*securityAttributes)
@@ -1179,7 +1186,7 @@ func (c Client) VolumeCreate(
 
 	if dpVolume {
 		request.SetVolumeType("DP")
-	} else {
+	} else if unixPermissions != "" {
 		request.SetUnixPermissions(unixPermissions)
 	}
 
@@ -1243,7 +1250,12 @@ func (c Client) VolumeModifyUnixPermissions(
 	volumeName, unixPermissions string,
 ) (*azgo.VolumeModifyIterResponse, error) {
 	volAttr := &azgo.VolumeModifyIterRequestAttributes{}
-	volSecurityUnixAttrs := azgo.NewVolumeSecurityUnixAttributesType().SetPermissions(unixPermissions)
+	volSecurityUnixAttrs := azgo.NewVolumeSecurityUnixAttributesType()
+	// Set Unix permission for NFS volume only.
+	if unixPermissions != "" {
+		volSecurityUnixAttrs.SetPermissions(unixPermissions)
+	}
+
 	volSecurityAttrs := azgo.NewVolumeSecurityAttributesType().SetVolumeSecurityUnixAttributes(*volSecurityUnixAttrs)
 	securityAttributes := azgo.NewVolumeAttributesType().SetVolumeSecurityAttributes(*volSecurityAttrs)
 	volAttr.SetVolumeAttributes(*securityAttributes)
@@ -1698,9 +1710,13 @@ func (c Client) QtreeCreate(
 	request := azgo.NewQtreeCreateRequest().
 		SetQtree(name).
 		SetVolume(volumeName).
-		SetMode(unixPermissions).
 		SetSecurityStyle(securityStyle).
 		SetExportPolicy(exportPolicy)
+
+	// Set Unix permission for NFS volume only.
+	if unixPermissions != "" {
+		request.SetMode(unixPermissions)
+	}
 
 	if qosPolicy != "" {
 		request.SetQosPolicyGroup(qosPolicy)
@@ -1784,10 +1800,10 @@ func (c Client) QtreeCount(ctx context.Context, volume string) (int, error) {
 }
 
 // QtreeExists returns true if the named Qtree exists (and is unique in the matching Flexvols)
-func (c Client) QtreeExists(ctx context.Context, name, volumePrefix string) (bool, string, error) {
+func (c Client) QtreeExists(ctx context.Context, name, volumePattern string) (bool, string, error) {
 	// Limit the qtrees to those matching the Flexvol and Qtree name prefixes
 	query := &azgo.QtreeListIterRequestQuery{}
-	queryInfo := azgo.NewQtreeInfoType().SetVolume(volumePrefix + "*").SetQtree(name)
+	queryInfo := azgo.NewQtreeInfoType().SetVolume(volumePattern).SetQtree(name)
 	query.SetQtreeInfo(*queryInfo)
 
 	// Limit the returned data to only the Flexvol and Qtree names
@@ -2244,7 +2260,7 @@ func (c Client) SVMGetAggregateNames() ([]string, error) {
 // equivalent to filer::> vserver show-aggregates
 func (c Client) VserverShowAggrGetIterRequest() (*azgo.VserverShowAggrGetIterResponse, error) {
 	response, err := azgo.NewVserverShowAggrGetIterRequest().
-		SetMaxRecords(DefaultZapiRecords).
+		SetMaxRecords(MaxZapiRecords).
 		ExecuteUsing(c.zr)
 	return response, err
 }
@@ -2790,36 +2806,10 @@ func (c Client) NetInterfaceGet() (*azgo.NetInterfaceGetIterResponse, error) {
 	response, err := azgo.NewNetInterfaceGetIterRequest().
 		SetMaxRecords(DefaultZapiRecords).
 		SetQuery(azgo.NetInterfaceGetIterRequestQuery{
-			NetInterfaceInfoPtr: &azgo.NetInterfaceInfoType{
-				OperationalStatusPtr: &LifOperationalStatusUp,
-			},
+			NetInterfaceInfoPtr: &azgo.NetInterfaceInfoType{},
 		}).ExecuteUsing(c.zr)
 
 	return response, err
-}
-
-func (c Client) NetInterfaceGetDataLIFsNode(ctx context.Context, ip string) (string, error) {
-	lifResponse, err := c.NetInterfaceGet()
-	if err = azgo.GetError(ctx, lifResponse, err); err != nil {
-		return "", fmt.Errorf("error checking network interfaces: %v", err)
-	}
-	var nodeName string
-
-	if lifResponse.Result.AttributesListPtr != nil {
-		for _, attrs := range lifResponse.Result.AttributesListPtr.NetInterfaceInfoPtr {
-			if ip == attrs.Address() {
-				nodeName = attrs.CurrentNode()
-				break
-			}
-		}
-	}
-
-	if nodeName == "" {
-		Logc(ctx).Warningf("No node found; no node meets the criteria (IP address: "+
-			"%s with at least one data LIF operational status of up)", ip)
-	}
-
-	return nodeName, nil
 }
 
 func (c Client) NetInterfaceGetDataLIFs(ctx context.Context, protocol string) ([]string, error) {
@@ -2831,9 +2821,11 @@ func (c Client) NetInterfaceGetDataLIFs(ctx context.Context, protocol string) ([
 	dataLIFs := make([]string, 0)
 	if lifResponse.Result.AttributesListPtr != nil {
 		for _, attrs := range lifResponse.Result.AttributesListPtr.NetInterfaceInfoPtr {
-			for _, proto := range attrs.DataProtocols().DataProtocolPtr {
-				if proto == protocol {
-					dataLIFs = append(dataLIFs, attrs.Address())
+			if attrs.OperationalStatus() == LifOperationalStatusUp {
+				for _, proto := range attrs.DataProtocols().DataProtocolPtr {
+					if proto == protocol {
+						dataLIFs = append(dataLIFs, attrs.Address())
+					}
 				}
 			}
 		}
@@ -3114,4 +3106,4 @@ func (c Client) IscsiInitiatorSetDefaultAuth(
 
 // iSCSI initiator operations END
 
-/////////////////////////////////////////////////////////////////////////////
+// ///////////////////////////////////////////////////////////////////////////

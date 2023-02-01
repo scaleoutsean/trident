@@ -201,7 +201,7 @@ type ZapiClientInterface interface {
 	// QtreeCount returns the number of Qtrees in the specified Flexvol, not including the Flexvol itself
 	QtreeCount(ctx context.Context, volume string) (int, error)
 	// QtreeExists returns true if the named Qtree exists (and is unique in the matching Flexvols)
-	QtreeExists(ctx context.Context, name, volumePrefix string) (bool, string, error)
+	QtreeExists(ctx context.Context, name, volumePattern string) (bool, string, error)
 	// QtreeGet returns all relevant details for a single qtree
 	// equivalent to filer::> volume qtree show
 	QtreeGet(name, volumePrefix string) (*azgo.QtreeInfoType, error)
@@ -312,7 +312,6 @@ type ZapiClientInterface interface {
 	// NetInterfaceGet returns the list of network interfaces with associated metadata
 	// equivalent to filer::> net interface list, but only those LIFs that are operational
 	NetInterfaceGet() (*azgo.NetInterfaceGetIterResponse, error)
-	NetInterfaceGetDataLIFsNode(ctx context.Context, ip string) (string, error)
 	NetInterfaceGetDataLIFs(ctx context.Context, protocol string) ([]string, error)
 	// SystemGetVersion returns the system version
 	// equivalent to filer::> version
@@ -356,4 +355,3 @@ type ZapiClientInterface interface {
 	//	                          -auth-type CHAP -user-name outboundUserName -outbound-user-name outboundPassphrase
 	IscsiInitiatorSetDefaultAuth(authType, userName, passphrase, outboundUserName, outboundPassphrase string) (*azgo.IscsiInitiatorSetDefaultAuthResponse, error)
 }
-

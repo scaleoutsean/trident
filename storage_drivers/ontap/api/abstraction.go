@@ -54,7 +54,7 @@ type OntapAPI interface {
 	ExportPolicyCreate(ctx context.Context, policy string) error
 	ExportPolicyDestroy(ctx context.Context, policy string) error
 	ExportPolicyExists(ctx context.Context, policyName string) (bool, error)
-	ExportRuleCreate(ctx context.Context, policyName, desiredPolicyRule string) error
+	ExportRuleCreate(ctx context.Context, policyName, desiredPolicyRule, nasProtocol string) error
 	ExportRuleDestroy(ctx context.Context, policyName string, ruleIndex int) error
 	ExportRuleList(ctx context.Context, policyName string) (map[string]int, error)
 
@@ -121,7 +121,7 @@ type OntapAPI interface {
 
 	GetSVMUUID() string
 
-	QtreeExists(ctx context.Context, name, volumePrefix string) (bool, string, error)
+	QtreeExists(ctx context.Context, name, volumePattern string) (bool, string, error)
 	QtreeCreate(
 		ctx context.Context, name, volumeName, unixPermissions, exportPolicy, securityStyle, qosPolicy string,
 	) error

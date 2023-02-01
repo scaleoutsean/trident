@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +26,8 @@ import (
 	"github.com/netapp/trident/utils"
 )
 
+var QtreeInternalIDRegex = regexp.MustCompile(`^/svm/(?P<svm>[^/]+)/flexvol/(?P<flexvol>[^/]+)/qtree/(?P<qtree>[^/]+)$`)
+
 const (
 	deletedQtreeNamePrefix                      = "deleted_"
 	maxQtreeNameLength                          = 64
@@ -38,7 +41,7 @@ const (
 	resizeTask                                  = "resize"
 )
 
-// NASQtreeStorageDriver is for NFS storage provisioning of qtrees
+// NASQtreeStorageDriver is for NFS and SMB storage provisioning of qtrees
 type NASQtreeStorageDriver struct {
 	initialized                      bool
 	Config                           drivers.OntapStorageDriverConfig
@@ -286,14 +289,25 @@ func (d *NASQtreeStorageDriver) Create(
 	// Generic user-facing message
 	createError := errors.New("volume creation failed")
 
+	volumePattern, name, err := d.SetVolumePatternToFindQtree(ctx, volConfig.InternalID, volConfig.InternalName,
+		d.FlexvolNamePrefix())
+	if err != nil {
+		return err
+	}
 	// Ensure volume doesn't already exist
-	exists, existsInFlexvol, err := d.API.QtreeExists(ctx, name, d.FlexvolNamePrefix())
+	exists, existsInFlexvol, err := d.API.QtreeExists(ctx, name, volumePattern)
 	if err != nil {
 		Logc(ctx).Errorf("Error checking for existing volume: %v.", err)
 		return createError
 	}
 	if exists {
 		Logc(ctx).WithFields(log.Fields{"qtree": name, "flexvol": existsInFlexvol}).Debug("Qtree already exists.")
+		// If qtree exists, update the volConfig.InternalID in case it was not set
+		// This is useful for "legacy" volumes which do not have InternalID set when they were created
+		if volConfig.InternalID == "" {
+			volConfig.InternalID = d.CreateQtreeInternalID(d.Config.SVM, existsInFlexvol, name)
+			Logc(ctx).WithFields(log.Fields{"InternalID": volConfig.InternalID}).Debug("setting InternalID")
+		}
 		return drivers.NewVolumeExistsError(name)
 	}
 
@@ -323,10 +337,7 @@ func (d *NASQtreeStorageDriver) Create(
 	}
 
 	// Get options
-	opts, err := d.GetVolumeOpts(ctx, volConfig, volAttributes)
-	if err != nil {
-		return err
-	}
+	opts := d.GetVolumeOpts(ctx, volConfig, volAttributes)
 
 	// Get Flexvol options with default fallback values
 	// see also: ontap_common.go#PopulateConfigurationDefaults
@@ -392,6 +403,8 @@ func (d *NASQtreeStorageDriver) Create(
 			createErrors = append(createErrors, fmt.Errorf(errMessage))
 			continue
 		}
+		volConfig.InternalID = d.CreateQtreeInternalID(d.Config.SVM, flexvol, name)
+		Logc(ctx).WithFields(log.Fields{"InternalID": volConfig.InternalID}).Debug("Created new qtree, setting InternalID")
 
 		// Grow or shrink the Flexvol as needed
 		err = d.resizeFlexvol(ctx, flexvol, sizeBytes)
@@ -482,7 +495,13 @@ func (d *NASQtreeStorageDriver) Destroy(ctx context.Context, volConfig *storage.
 	// Generic user-facing message
 	deleteError := errors.New("volume deletion failed")
 
-	exists, flexvol, err := d.API.QtreeExists(ctx, name, d.FlexvolNamePrefix())
+	volumePattern, name, err := d.SetVolumePatternToFindQtree(ctx, volConfig.InternalID, volConfig.InternalName,
+		d.FlexvolNamePrefix())
+	if err != nil {
+		return err
+	}
+	// Check that volume exists
+	exists, flexvol, err := d.API.QtreeExists(ctx, name, volumePattern)
 	if err != nil {
 		Logc(ctx).Errorf("Error checking for existing qtree. %s", err.Error())
 		return deleteError
@@ -490,6 +509,13 @@ func (d *NASQtreeStorageDriver) Destroy(ctx context.Context, volConfig *storage.
 	if !exists {
 		Logc(ctx).WithField("qtree", name).Warn("Qtree not found.")
 		return nil
+	}
+
+	// If qtree exists, update the volConfig.InternalID in case it was not set
+	// This is useful for "legacy" volumes which do not have InternalID set when they were created
+	if volConfig.InternalID == "" {
+		volConfig.InternalID = d.CreateQtreeInternalID(d.Config.SVM, flexvol, name)
+		Logc(ctx).WithFields(log.Fields{"InternalID": volConfig.InternalID}).Debug("setting InternalID")
 	}
 
 	// Rename qtree so it doesn't show up in lists while ONTAP is deleting it in the background.
@@ -539,8 +565,13 @@ func (d *NASQtreeStorageDriver) Publish(
 		defer Logc(ctx).WithFields(fields).Debug("<<<< Publish")
 	}
 
+	volumePattern, name, err := d.SetVolumePatternToFindQtree(ctx, volConfig.InternalID, volConfig.InternalName,
+		d.FlexvolNamePrefix())
+	if err != nil {
+		return err
+	}
 	// Check if qtree exists, and find its Flexvol so we can build the export location
-	exists, flexvol, err := d.API.QtreeExists(ctx, name, d.FlexvolNamePrefix())
+	exists, flexvol, err := d.API.QtreeExists(ctx, name, volumePattern)
 	if err != nil {
 		Logc(ctx).Errorf("Error checking for existing qtree. %s", err.Error())
 		return errors.New("volume mount failed")
@@ -550,6 +581,13 @@ func (d *NASQtreeStorageDriver) Publish(
 		return fmt.Errorf("volume %s not found", name)
 	}
 
+	// If qtree exists, update the volConfig.InternalID in case it was not set
+	// This is useful for "legacy" volumes which do not have InternalID set when they were created
+	if volConfig.InternalID == "" {
+		volConfig.InternalID = d.CreateQtreeInternalID(d.Config.SVM, flexvol, name)
+		Logc(ctx).WithFields(log.Fields{"InternalID": volConfig.InternalID}).Debug("setting InternalID")
+	}
+
 	// Determine mount options (volume config wins, followed by backend config)
 	mountOptions := d.Config.NfsMountOptions
 	if volConfig.MountOptions != "" {
@@ -557,10 +595,16 @@ func (d *NASQtreeStorageDriver) Publish(
 	}
 
 	// Add fields needed by Attach
-	publishInfo.NfsPath = fmt.Sprintf("/%s/%s", flexvol, name)
-	publishInfo.NfsServerIP = d.Config.DataLIF
-	publishInfo.FilesystemType = "nfs"
-	publishInfo.MountOptions = mountOptions
+	if d.Config.NASType == sa.SMB {
+		publishInfo.SMBPath = volConfig.AccessInfo.SMBPath
+		publishInfo.SMBServer = d.Config.DataLIF
+		publishInfo.FilesystemType = sa.SMB
+	} else {
+		publishInfo.NfsPath = fmt.Sprintf("/%s/%s", flexvol, name)
+		publishInfo.NfsServerIP = d.Config.DataLIF
+		publishInfo.FilesystemType = sa.NFS
+		publishInfo.MountOptions = mountOptions
+	}
 
 	return d.publishQtreeShare(ctx, name, flexvol, publishInfo)
 }
@@ -711,7 +755,17 @@ func (d *NASQtreeStorageDriver) Get(ctx context.Context, name string) error {
 	// Generic user-facing message
 	getError := fmt.Errorf("volume %s not found", name)
 
-	exists, flexvol, err := d.API.QtreeExists(ctx, name, d.FlexvolNamePrefix())
+	volConfig := &storage.VolumeConfig{
+		InternalName: name,
+	}
+
+	volumePattern, name, err := d.SetVolumePatternToFindQtree(ctx, volConfig.InternalID, volConfig.InternalName,
+		d.FlexvolNamePrefix())
+	if err != nil {
+		return err
+	}
+	// Check that volume exists
+	exists, flexvol, err := d.API.QtreeExists(ctx, name, volumePattern)
 	if err != nil {
 		Logc(ctx).Errorf("Error checking for existing qtree. %s", err.Error())
 		return getError
@@ -719,6 +773,13 @@ func (d *NASQtreeStorageDriver) Get(ctx context.Context, name string) error {
 	if !exists {
 		Logc(ctx).WithField("qtree", name).Debug("Qtree not found.")
 		return getError
+	}
+
+	// If qtree exists, update the volConfig.InternalID in case it was not set
+	// This is useful for "legacy" volumes which do not have InternalID set when they were created
+	if volConfig.InternalID == "" {
+		volConfig.InternalID = d.CreateQtreeInternalID(d.Config.SVM, flexvol, name)
+		Logc(ctx).WithFields(log.Fields{"InternalID": volConfig.InternalID}).Debug("setting InternalID")
 	}
 
 	Logc(ctx).WithFields(log.Fields{"qtree": name, "flexvol": flexvol}).Debug("Qtree found.")
@@ -770,13 +831,25 @@ func (d *NASQtreeStorageDriver) createFlexvolForQtree(
 	ctx context.Context, aggregate, spaceReserve, snapshotPolicy, tieringPolicy string, enableSnapshotDir bool,
 	enableEncryption *bool, snapshotReserve, exportPolicy string,
 ) (string, error) {
+	var unixPermissions string
+	var securityStyle string
+
 	flexvol := d.FlexvolNamePrefix() + utils.RandomString(10)
 	size := "1g"
-	unixPermissions := "0711"
+
 	if !d.Config.AutoExportPolicy {
 		exportPolicy = d.flexvolExportPolicy
 	}
-	securityStyle := "unix"
+
+	// Set Unix permission for NFS volume only.
+	switch d.Config.NASType {
+	case sa.SMB:
+		unixPermissions = ""
+		securityStyle = DefaultSecurityStyleSMB
+	case sa.NFS:
+		unixPermissions = "0711"
+		securityStyle = DefaultSecurityStyleNFS
+	}
 
 	snapshotReserveInt, err := GetSnapshotReserve(snapshotPolicy, snapshotReserve)
 	if err != nil {
@@ -859,7 +932,8 @@ func (d *NASQtreeStorageDriver) createFlexvolForQtree(
 // is returned at random.
 func (d *NASQtreeStorageDriver) getFlexvolForQtree(
 	ctx context.Context, aggregate, spaceReserve, snapshotPolicy, tieringPolicy, snapshotReserve string,
-	enableSnapshotDir bool, enableEncryption *bool, shouldLimitFlexvolQuotaSize bool, sizeBytes, flexvolQuotaSizeLimit uint64,
+	enableSnapshotDir bool, enableEncryption *bool, shouldLimitFlexvolQuotaSize bool,
+	sizeBytes, flexvolQuotaSizeLimit uint64,
 ) (string, error) {
 	snapshotReserveInt, err := GetSnapshotReserve(snapshotPolicy, snapshotReserve)
 	if err != nil {
@@ -1255,7 +1329,7 @@ func (d *NASQtreeStorageDriver) ensureDefaultExportPolicyRule(ctx context.Contex
 		// No rules, so create one for IPv4 and IPv6
 		rules := []string{"0.0.0.0/0", "::/0"}
 		for _, rule := range rules {
-			err := d.API.ExportRuleCreate(ctx, d.flexvolExportPolicy, rule)
+			err := d.API.ExportRuleCreate(ctx, d.flexvolExportPolicy, rule, d.Config.NASType)
 			if err != nil {
 				return fmt.Errorf("error creating export rule: %v", err)
 			}
@@ -1290,8 +1364,8 @@ func (d *NASQtreeStorageDriver) getStoragePoolAttributes() map[string]sa.Offer {
 
 func (d *NASQtreeStorageDriver) GetVolumeOpts(
 	ctx context.Context, volConfig *storage.VolumeConfig, requests map[string]sa.Request,
-) (map[string]string, error) {
-	return getVolumeOptsCommon(ctx, volConfig, requests), nil
+) map[string]string {
+	return getVolumeOptsCommon(ctx, volConfig, requests)
 }
 
 func (d *NASQtreeStorageDriver) GetInternalVolumeName(ctx context.Context, name string) string {
@@ -1330,18 +1404,37 @@ func (d *NASQtreeStorageDriver) CreatePrepare(ctx context.Context, volConfig *st
 
 func (d *NASQtreeStorageDriver) CreateFollowup(ctx context.Context, volConfig *storage.VolumeConfig) error {
 	// Determine which Flexvol contains the qtree
-	exists, flexvol, err := d.API.QtreeExists(ctx, volConfig.InternalName, d.FlexvolNamePrefix())
+	volumePattern, name, err := d.SetVolumePatternToFindQtree(ctx, volConfig.InternalID, volConfig.InternalName,
+		d.FlexvolNamePrefix())
+	if err != nil {
+		return err
+	}
+	// Check that volume exists
+	exists, flexvol, err := d.API.QtreeExists(ctx, name, volumePattern)
 	if err != nil {
 		return fmt.Errorf("could not determine if qtree %s exists: %v", volConfig.InternalName, err)
 	}
 	if !exists {
 		return fmt.Errorf("could not find qtree %s", volConfig.InternalName)
 	}
+	// If qtree exists, update the volConfig.InternalID in case it was not set
+	// This is useful for "legacy" volumes which do not have InternalID set when they were created
+	if volConfig.InternalID == "" {
+		volConfig.InternalID = d.CreateQtreeInternalID(d.Config.SVM, flexvol, name)
+		Logc(ctx).WithFields(log.Fields{"InternalID": volConfig.InternalID}).Debug("setting InternalID")
+	}
 
 	// Set export path info on the volume config
-	volConfig.AccessInfo.NfsServerIP = d.Config.DataLIF
-	volConfig.AccessInfo.NfsPath = fmt.Sprintf("/%s/%s", flexvol, volConfig.InternalName)
-	volConfig.AccessInfo.MountOptions = strings.TrimPrefix(d.Config.NfsMountOptions, "-o ")
+	if d.Config.NASType == sa.SMB {
+		volConfig.AccessInfo.SMBServer = d.Config.DataLIF
+		volConfig.AccessInfo.SMBPath = ConstructOntapNASQTreeSMBVolumePath(ctx, d.Config.SMBShare, flexvol,
+			volConfig.InternalName)
+		volConfig.FileSystem = sa.SMB
+	} else {
+		volConfig.AccessInfo.NfsServerIP = d.Config.DataLIF
+		volConfig.AccessInfo.NfsPath = fmt.Sprintf("/%s/%s", flexvol, volConfig.InternalName)
+		volConfig.AccessInfo.MountOptions = strings.TrimPrefix(d.Config.NfsMountOptions, "-o ")
+	}
 
 	return nil
 }
@@ -1515,10 +1608,6 @@ func (d *NASQtreeStorageDriver) GetUpdateType(_ context.Context, driverOrig stor
 		return bitmap
 	}
 
-	if d.Config.DataLIF != dOrig.Config.DataLIF {
-		bitmap.Add(storage.VolumeAccessInfoChange)
-	}
-
 	if d.Config.Password != dOrig.Config.Password {
 		bitmap.Add(storage.PasswordChange)
 	}
@@ -1683,8 +1772,13 @@ func (d *NASQtreeStorageDriver) Resize(ctx context.Context, volConfig *storage.V
 	// Generic user-facing message
 	resizeError := errors.New("storage driver failed to resize the volume")
 
+	volumePattern, name, err := d.SetVolumePatternToFindQtree(ctx, volConfig.InternalID, volConfig.InternalName,
+		d.FlexvolNamePrefix())
+	if err != nil {
+		return err
+	}
 	// Check that volume exists
-	exists, flexvol, err := d.API.QtreeExists(ctx, name, d.FlexvolNamePrefix())
+	exists, flexvol, err := d.API.QtreeExists(ctx, name, volumePattern)
 	if err != nil {
 		Logc(ctx).WithField("error", err).Error("Error checking for existing volume.")
 		return resizeError
@@ -1692,6 +1786,13 @@ func (d *NASQtreeStorageDriver) Resize(ctx context.Context, volConfig *storage.V
 	if !exists {
 		Logc(ctx).WithFields(log.Fields{"qtree": name, "flexvol": flexvol}).Debug("Qtree does not exist.")
 		return fmt.Errorf("volume %s does not exist", name)
+	}
+
+	// If qtree exists, update the volConfig.InternalID in case it was not set
+	// This is useful for "legacy" volumes which do not have InternalID set when they were created
+	if volConfig.InternalID == "" {
+		volConfig.InternalID = d.CreateQtreeInternalID(d.Config.SVM, flexvol, name)
+		Logc(ctx).WithFields(log.Fields{"InternalID": volConfig.InternalID}).Debug("setting InternalID")
 	}
 
 	// Calculate the delta size needed to resize the Qtree quota
@@ -1799,4 +1900,59 @@ func (d NASQtreeStorageDriver) GoString() string {
 // GetCommonConfig returns driver's CommonConfig
 func (d NASQtreeStorageDriver) GetCommonConfig(context.Context) *drivers.CommonStorageDriverConfig {
 	return d.Config.CommonStorageDriverConfig
+}
+
+// ParseQtreeInternalID parses the passed string which is in the format /svm/<svm_name>/flexvol/<flexvol_name>/qtree/<qtree_name>
+// and returns svm, flaexvol and qtree name
+func (d NASQtreeStorageDriver) ParseQtreeInternalID(internalId string) (svm, flexvol, qtree string, err error) {
+	match := QtreeInternalIDRegex.FindStringSubmatch(internalId)
+	if match == nil {
+		err = fmt.Errorf("internalId ID %s is invalid", internalId)
+		return
+	}
+
+	paramsMap := make(map[string]string)
+	for idx, subExpName := range QtreeInternalIDRegex.SubexpNames() {
+		if idx > 0 && idx <= len(match) {
+			paramsMap[subExpName] = match[idx]
+		}
+	}
+
+	svm = paramsMap["svm"]
+	flexvol = paramsMap["flexvol"]
+	qtree = paramsMap["qtree"]
+	return
+}
+
+// CreateQtreeInternalID creates a string in the format /svm/<svm_name>/flexvol/<flexvol_name>/qtree/<qtree_name>
+func (d NASQtreeStorageDriver) CreateQtreeInternalID(svm, flexvol, name string) string {
+	return fmt.Sprintf("/svm/%s/flexvol/%s/qtree/%s", svm, flexvol, name)
+}
+
+// SetVolumePatternToFindQtree appropriately sets volumePattern with '*' or with flexvol name depending on internalId
+func (d NASQtreeStorageDriver) SetVolumePatternToFindQtree(
+	ctx context.Context, internalID, internalName, volumePrefix string,
+) (string, string, error) {
+	volumePattern := "*"
+	qtreeName := internalName
+	flexVolumeName := ""
+	var err error
+	if internalID == "" {
+		if volumePrefix != "" {
+			volumePattern = volumePrefix + "*"
+		}
+	} else {
+		if _, flexVolumeName, qtreeName, err = d.ParseQtreeInternalID(internalID); err == nil {
+			volumePattern = flexVolumeName
+		} else {
+			return "", "", fmt.Errorf("error in parsing Internal ID %s", internalID)
+		}
+	}
+	fields := log.Fields{
+		"volumePattern": volumePattern,
+		"qtreeName":     qtreeName,
+	}
+	Logc(ctx).WithFields(fields).Debug("setting volumePattern")
+
+	return volumePattern, qtreeName, nil
 }

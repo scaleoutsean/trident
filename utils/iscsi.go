@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -24,13 +25,36 @@ import (
 
 const (
 	iSCSIErrNoObjsFound                 = 21
-	iSCSIErrLoginAuthFailed             = 24
+	ISCSIErrLoginAuthFailed             = 24
 	multipathDeviceDiscoveryTimeoutSecs = 90
 	temporaryMountDir                   = "/tmp_mnt"
 	volumeMountDir                      = "/vol_mnt"
 	unknownFstype                       = "<unknown>"
-	iscsiadmLoginTimeout                = "10"
+	iscsiadmLoginTimeoutValue           = 10
+	iscsiadmLoginTimeout                = iscsiadmLoginTimeoutValue * time.Second
 	iscsiadmLoginRetryMax               = "1"
+	iSCSISessionStateLoggedIn           = "LOGGED_IN"
+	iSCSIMaxFlushWaitDuration           = 6 * time.Minute
+
+	SessionInfoSource          = "sessionSource"
+	SessionSourceNodeStage     = "nodeStage"
+	SessionSourceTrackingInfo  = "trackingInfo"
+	SessionSourceCurrentStatus = "currentStatus"
+)
+
+var (
+
+	// Exclusion list contains keywords if found in any Target IQN should not be considered for
+	// self-healing.
+	// solidfire: Exclude solidfire for now. Solidfire maintains a different handle 'Current Portal'
+	//            which is not published or captured in VolumePublishInfo, current self-healing logic does not
+	//            work for logout, login or scan as it is designed to work with published portal information.
+	iSCSISelfHealingExclusion = []string{"solidfire"}
+
+	IscsiUtils = NewIscsiReconcileUtils()
+
+	// Non-persistent map to maintain flush delays/errors if any, for device path(s).
+	iSCSIVolumeFlushExceptions = make(map[string]time.Time)
 )
 
 // AttachISCSIVolumeRetry attaches a volume with retry by invoking AttachISCSIVolume with backoff.
@@ -41,7 +65,7 @@ func AttachISCSIVolumeRetry(
 	defer Logc(ctx).Debug("<<<< iscsi.AttachISCSIVolumeRetry")
 	var err error
 
-	if err = iSCSIPreChecks(ctx); err != nil {
+	if err = ISCSIPreChecks(ctx); err != nil {
 		return err
 	}
 
@@ -50,7 +74,10 @@ func AttachISCSIVolumeRetry(
 	}
 
 	attachNotify := func(err error, duration time.Duration) {
-		Logc(ctx).WithField("increment", duration).Debug("Attach iSCSI volume is not yet through, waiting.")
+		Logc(ctx).WithFields(log.Fields{
+			"increment": duration,
+			"error":     err,
+		}).Debug("Attach iSCSI volume is not complete, waiting.")
 	}
 
 	attachBackoff := backoff.NewExponentialBackOff()
@@ -99,7 +126,7 @@ func AttachISCSIVolume(ctx context.Context, name, mountpoint string, publishInfo
 		"fstype":         publishInfo.FilesystemType,
 	}).Debug("Attaching iSCSI volume.")
 
-	if err = iSCSIPreChecks(ctx); err != nil {
+	if err = ISCSIPreChecks(ctx); err != nil {
 		return err
 	}
 	// Ensure we are logged into correct portals
@@ -187,16 +214,14 @@ func AttachISCSIVolume(ctx context.Context, name, mountpoint string, publishInfo
 			return fmt.Errorf("could not parse LUKSEncryption into a bool, got %v", publishInfo.LUKSEncryption)
 		}
 	}
+
 	if isLUKSDevice {
-		// Try to Open with current luks passphrase
-		luksPassphrase, ok := secrets["luks-passphrase"]
-		if !ok {
-			return fmt.Errorf("could not open LUKS device, no passphrase provided")
-		}
-		luksFormatted, devicePath, err = EnsureLUKSDevice(ctx, devicePath, name, luksPassphrase)
+		luksDevice, _ := NewLUKSDevice(devicePath, name)
+		luksFormatted, err = EnsureLUKSDeviceMappedOnHost(ctx, luksDevice, name, secrets)
 		if err != nil {
-			return fmt.Errorf("could not open LUKS device; %v", err)
+			return err
 		}
+		devicePath = luksDevice.MappedDevicePath()
 	}
 
 	// Return the device in the publish info in case the mount will be done later
@@ -314,9 +339,9 @@ func parseInitiatorIQNs(ctx context.Context, contents string) []string {
 	return iqns
 }
 
-// getSysfsBlockDirsForLUN returns the list of directories in sysfs where the block devices should appear
+// GetSysfsBlockDirsForLUN returns the list of directories in sysfs where the block devices should appear
 // after the scan is successful. One directory is returned for each path in the host session map.
-func getSysfsBlockDirsForLUN(lunID int, hostSessionMap map[int]int) []string {
+func (h *IscsiReconcileHelper) GetSysfsBlockDirsForLUN(lunID int, hostSessionMap map[int]int) []string {
 	paths := make([]string, 0)
 	for hostNumber, sessionNumber := range hostSessionMap {
 		p := fmt.Sprintf(
@@ -327,8 +352,8 @@ func getSysfsBlockDirsForLUN(lunID int, hostSessionMap map[int]int) []string {
 	return paths
 }
 
-// getDevicesForLUN find the /dev/sd* device names for an iSCSI LUN.
-func getDevicesForLUN(paths []string) ([]string, error) {
+// GetDevicesForLUN find the /dev/sd* device names for an iSCSI LUN.
+func (h *IscsiReconcileHelper) GetDevicesForLUN(paths []string) ([]string, error) {
 	devices := make([]string, 0)
 	for _, p := range paths {
 		dirname := p + "/block"
@@ -363,7 +388,7 @@ func waitForDeviceScan(ctx context.Context, lunID int, iSCSINodeName string) err
 	Logc(ctx).WithFields(fields).Debug(">>>> iscsi.waitForDeviceScan")
 	defer Logc(ctx).WithFields(fields).Debug("<<<< iscsi.waitForDeviceScan")
 
-	hostSessionMap := GetISCSIHostSessionMapForTarget(ctx, iSCSINodeName)
+	hostSessionMap := IscsiUtils.GetISCSIHostSessionMapForTarget(ctx, iSCSINodeName)
 	if len(hostSessionMap) == 0 {
 		return fmt.Errorf("no iSCSI hosts found for target %s", iSCSINodeName)
 	}
@@ -378,7 +403,7 @@ func waitForDeviceScan(ctx context.Context, lunID int, iSCSINodeName string) err
 		Logc(ctx).WithField("scanError", err).Error("Could not scan for new LUN.")
 	}
 
-	paths := getSysfsBlockDirsForLUN(lunID, hostSessionMap)
+	paths := IscsiUtils.GetSysfsBlockDirsForLUN(lunID, hostSessionMap)
 	Logc(ctx).Debugf("Scanning paths: %v", paths)
 	found := make([]string, 0)
 
@@ -405,8 +430,8 @@ func waitForDeviceScan(ctx context.Context, lunID int, iSCSINodeName string) err
 		if _, err := execCommand(ctx, "ls", "-al", "/dev"); err != nil {
 			Logc(ctx).Warnf("Could not run ls -al /dev: %v", err)
 		}
-		if _, err := execCommand(ctx, "ls", "-al", "/dev/mapper"); err != nil {
-			Logc(ctx).Warnf("Could not run ls -al /dev/mapper: %v", err)
+		if _, err := execCommand(ctx, "ls", "-al", devMapperRoot); err != nil {
+			Logc(ctx).Warnf("Could not run ls -al %s: %v", devMapperRoot, err)
 		}
 		if _, err := execCommand(ctx, "ls", "-al", "/dev/disk/by-path"); err != nil {
 			Logc(ctx).Warnf("Could not run ls -al /dev/disk/by-path: %v", err)
@@ -468,16 +493,12 @@ func iSCSIDiscovery(ctx context.Context, portal string) ([]ISCSIDiscoveryInfo, e
 
 	/*
 	   iscsiadm -m discovery -t st -p 10.63.152.249:3260
-
 	   10.63.152.249:3260,1 iqn.1992-08.com.netapp:2752.600a0980006074c20000000056b32c4d
 	   10.63.152.250:3260,2 iqn.1992-08.com.netapp:2752.600a0980006074c20000000056b32c4d
-
 	   a[0]==10.63.152.249:3260,1
 	   a[1]==iqn.1992-08.com.netapp:2752.600a0980006074c20000000056b32c4d
-
 	   For IPv6
 	   [fd20:8b1e:b258:2000:f816:3eff:feec:2]:3260,1038 iqn.1992-08.com.netapp:sn.7894d7af053711ea88b100a0b886136a
-
 	   a[0]==[fd20:8b1e:b258:2000:f816:3eff:feec:2]:3260,1038
 	   a[1]==iqn.1992-08.com.netapp:sn.7894d7af053711ea88b100a0b886136a
 	*/
@@ -541,10 +562,8 @@ func getISCSISessionInfo(ctx context.Context) ([]ISCSISessionInfo, error) {
 
 	/*
 	   # iscsiadm -m session
-
 	   tcp: [3] 10.0.207.7:3260,1028 iqn.1992-08.com.netapp:sn.afbb1784f77411e582f8080027e22798:vs.3 (non-flash)
 	   tcp: [4] 10.0.207.9:3260,1029 iqn.1992-08.com.netapp:sn.afbb1784f77411e582f8080027e22798:vs.3 (non-flash)
-
 	   a[0]==tcp:
 	   a[1]==[4]
 	   a[2]==10.0.207.9:3260,1029
@@ -664,6 +683,7 @@ func portalsToLogin(ctx context.Context, targetIQN string, portals []string) ([]
 	Logc(ctx).WithFields(logFields).Debug(">>>> iscsi.portalsToLogin")
 	defer Logc(ctx).Debug("<<<< iscsi.portalsToLogin")
 
+	portalsInStaleState := make([]string, 0)
 	portalsNotLoggedIn := make([]string, len(portals))
 	copy(portalsNotLoggedIn, portals)
 
@@ -683,11 +703,25 @@ func portalsToLogin(ctx context.Context, targetIQN string, portals []string) ([]
 
 				return mainIpAddress == valIpAddress
 			}
+
+			lenBeforeCheck := len(portalsNotLoggedIn)
 			portalsNotLoggedIn = RemoveStringFromSliceConditionally(portalsNotLoggedIn, e.Portal, matchFunc)
+			lenAfterCheck := len(portalsNotLoggedIn)
+
+			// If the portal is logged in ensure it is not stale
+			if lenBeforeCheck != lenAfterCheck {
+				if IsISCSISessionStale(ctx, e.SID) {
+					portalsInStaleState = append(portalsInStaleState, e.Portal)
+				}
+			}
 		}
 	}
 
-	loggedIn := len(portals) != len(portalsNotLoggedIn)
+	if len(portals) == len(portalsInStaleState) {
+		return nil, false, fmt.Errorf("no new session to establish and existing session(s) might be in unhealthy state")
+	}
+
+	loggedIn := len(portals) != (len(portalsNotLoggedIn) + len(portalsInStaleState))
 	return portalsNotLoggedIn, loggedIn, nil
 }
 
@@ -701,7 +735,8 @@ func formatPortal(portal string) string {
 	}
 }
 
-// iSCSIScanTargetLUN scans a single LUN on an iSCSI target to discover it.
+// iSCSIScanTargetLUN scans a single LUN or all the LUNs on an iSCSI target to discover it.
+// If all the LUNs are to be scanned please pass -1 for lunID.
 func iSCSIScanTargetLUN(ctx context.Context, lunID int, hosts []int) error {
 	fields := log.Fields{"hosts": hosts, "lunID": lunID}
 	Logc(ctx).WithFields(fields).Debug(">>>> iscsi.iSCSIScanTargetLUN")
@@ -712,6 +747,12 @@ func iSCSIScanTargetLUN(ctx context.Context, lunID int, hosts []int) error {
 		err error
 	)
 
+	// By default, scan for all the LUNs
+	scanCmd := "0 0 -"
+	if lunID >= 0 {
+		scanCmd = fmt.Sprintf("0 0 %d", lunID)
+	}
+
 	listAllISCSIDevices(ctx)
 	for _, hostNumber := range hosts {
 
@@ -721,7 +762,6 @@ func iSCSIScanTargetLUN(ctx context.Context, lunID int, hosts []int) error {
 			return err
 		}
 
-		scanCmd := fmt.Sprintf("0 0 %d", lunID)
 		if written, err := f.WriteString(scanCmd); err != nil {
 			Logc(ctx).WithFields(log.Fields{"file": filename, "error": err}).Warning("Could not write to file.")
 			f.Close()
@@ -746,14 +786,14 @@ func iSCSIScanTargetLUN(ctx context.Context, lunID int, hosts []int) error {
 
 // IsAlreadyAttached checks if there is already an established iSCSI session to the specified LUN.
 func IsAlreadyAttached(ctx context.Context, lunID int, targetIqn string) bool {
-	hostSessionMap := GetISCSIHostSessionMapForTarget(ctx, targetIqn)
+	hostSessionMap := IscsiUtils.GetISCSIHostSessionMapForTarget(ctx, targetIqn)
 	if len(hostSessionMap) == 0 {
 		return false
 	}
 
-	paths := getSysfsBlockDirsForLUN(lunID, hostSessionMap)
+	paths := IscsiUtils.GetSysfsBlockDirsForLUN(lunID, hostSessionMap)
 
-	devices, err := getDevicesForLUN(paths)
+	devices, err := IscsiUtils.GetDevicesForLUN(paths)
 	if nil != err {
 		return false
 	}
@@ -853,8 +893,8 @@ func handleInvalidSerials(
 		return nil
 	}
 
-	hostSessionMap := GetISCSIHostSessionMapForTarget(ctx, targetIqn)
-	paths := getSysfsBlockDirsForLUN(lunID, hostSessionMap)
+	hostSessionMap := IscsiUtils.GetISCSIHostSessionMapForTarget(ctx, targetIqn)
+	paths := IscsiUtils.GetSysfsBlockDirsForLUN(lunID, hostSessionMap)
 	for _, path := range paths {
 		serial, err := getLunSerial(ctx, path)
 		if err != nil {
@@ -899,7 +939,7 @@ func handleInvalidSerials(
 
 // GetISCSIHostSessionMapForTarget returns a map of iSCSI host numbers to iSCSI session numbers
 // for a given iSCSI target.
-func GetISCSIHostSessionMapForTarget(ctx context.Context, iSCSINodeName string) map[int]int {
+func (h *IscsiReconcileHelper) GetISCSIHostSessionMapForTarget(ctx context.Context, iSCSINodeName string) map[int]int {
 	fields := log.Fields{"iSCSINodeName": iSCSINodeName}
 	Logc(ctx).WithFields(fields).Debug(">>>> iscsi.GetISCSIHostSessionMapForTarget")
 	defer Logc(ctx).WithFields(fields).Debug("<<<< iscsi.GetISCSIHostSessionMapForTarget")
@@ -929,8 +969,8 @@ func GetISCSIHostSessionMapForTarget(ctx context.Context, iSCSINodeName string) 
 			devicePath := sysPath + hostName + "/device/"
 			if deviceDirs, err := ioutil.ReadDir(devicePath); err != nil {
 				Logc(ctx).WithFields(log.Fields{
-					"error":      err,
-					"devicePath": devicePath,
+					"error":         err,
+					"rawDevicePath": devicePath,
 				}).Error("Could not read device path.")
 				return hostSessionMap
 			} else {
@@ -1072,7 +1112,7 @@ func updateDiscoveryDb(ctx context.Context, tp, iface, key, value string) error 
 	}).Debug(">>>> iscsi.updateDiscoveryDb")
 	defer Logc(ctx).Debug("<<<< iscsi.updateDiscoveryDb")
 
-	output, err := execCommand(ctx, "iscsiadm", "-m", "discoverydb",
+	output, err := execIscsiadmCommandWithTimeout(ctx, iscsiadmLoginTimeout, "-m", "discoverydb",
 		"-t", "st", "-p", tp, "-I", iface, "-o", "update", "-n", key, "-v", value)
 	if err != nil {
 		Logc(ctx).WithFields(log.Fields{
@@ -1123,7 +1163,9 @@ func ensureIscsiTarget(
 		// call.
 
 		// Ignore result
-		_, _ = execCommand(ctx, "iscsiadm", "-m", "discoverydb", "-t", "st", "-p", tp, "-I", iface, "-o", "new")
+		_, _ = execIscsiadmCommandWithTimeout(ctx, iscsiadmLoginTimeout, "-m", "discoverydb", "-t", "st", "-p", tp,
+			"-I",
+			iface, "-o", "new")
 
 		err = updateDiscoveryDb(ctx, tp, iface, "discovery.sendtargets.auth.authmethod", "CHAP")
 		if err != nil {
@@ -1162,7 +1204,7 @@ func ensureIscsiTarget(
 
 	// Discovery is here. This will populate the iscsiadm database with the
 	// ALL of the nodes known to the given portal.
-	output, err := execCommand(ctx, "iscsiadm", "-m", "discoverydb",
+	output, err := execIscsiadmCommandWithTimeout(ctx, iscsiadmLoginTimeout, "-m", "discoverydb",
 		"-t", "st", "-p", tp, "-I", iface, "-D")
 	if err != nil {
 		Logc(ctx).WithFields(log.Fields{
@@ -1170,6 +1212,12 @@ func ensureIscsiTarget(
 			"error":  err,
 			"output": string(output),
 		}).Error("Failed to discover targets")
+
+		exitErr, ok := err.(*exec.ExitError)
+		if ok && exitErr.ProcessState.Sys().(syscall.WaitStatus).ExitStatus() == ISCSIErrLoginAuthFailed {
+			return AuthError("failed to discover targets: CHAP authorization failure")
+		}
+
 		return fmt.Errorf("failed to discover targets: %v", err)
 	}
 
@@ -1207,15 +1255,48 @@ func configureISCSITarget(ctx context.Context, iqn, portal, name, value string) 
 	return nil
 }
 
-// loginISCSITarget logs in to an iSCSI target.
-func loginISCSITarget(ctx context.Context, publishInfo *VolumePublishInfo, portal string) error {
+// GetAllVolumeIDs returns names of all the volume IDs based on tracking files
+func GetAllVolumeIDs(ctx context.Context, trackingFileDirectory string) []string {
+	Logc(ctx).WithField("trackingFileDirectory", trackingFileDirectory).Debug(">>>> iscsi.GetAllVolumeIDs")
+	defer Logc(ctx).Debug("<<<< iscsi.GetAllVolumeIDs")
+
+	files, err := ioutil.ReadDir(trackingFileDirectory)
+	if err != nil {
+		Logc(ctx).WithFields(log.Fields{
+			"error": err,
+		}).Warn("Failed to get list of tracking files.")
+
+		return nil
+	}
+
+	if len(files) == 0 {
+		Logc(ctx).Debug("No tracking file found.")
+		return nil
+	}
+
+	volumeIDs := make([]string, 0)
+	for _, file := range files {
+		if !file.IsDir() && strings.HasPrefix(file.Name(), "pvc-") && strings.HasSuffix(file.Name(), ".json") {
+			volumeIDs = append(volumeIDs, strings.TrimSuffix(file.Name(), ".json"))
+		}
+	}
+
+	if len(volumeIDs) == 0 {
+		Logc(ctx).Debug("No volume ID found.")
+	}
+
+	return volumeIDs
+}
+
+// LoginISCSITarget logs in to an iSCSI target.
+func LoginISCSITarget(ctx context.Context, publishInfo *VolumePublishInfo, portal string) error {
 	Logc(ctx).WithFields(log.Fields{
 		"IQN":     publishInfo.IscsiTargetIQN,
 		"Portal":  portal,
 		"iface":   publishInfo.IscsiInterface,
 		"useCHAP": publishInfo.UseCHAP,
-	}).Debug(">>>> iscsi.loginISCSITarget")
-	defer Logc(ctx).Debug("<<<< iscsi.loginISCSITarget")
+	}).Debug(">>>> iscsi.LoginISCSITarget")
+	defer Logc(ctx).Debug("<<<< iscsi.LoginISCSITarget")
 
 	args := []string{"-m", "node", "-T", publishInfo.IscsiTargetIQN, "-p", formatPortal(portal)}
 	listAllISCSIDevices(ctx)
@@ -1284,7 +1365,7 @@ func loginISCSITarget(ctx context.Context, publishInfo *VolumePublishInfo, porta
 			"--op=update",
 			"--name",
 			"node.conn[0].timeo.login_timeout",
-			"--value=" + iscsiadmLoginTimeout,
+			fmt.Sprintf("--value=%d", iscsiadmLoginTimeoutValue),
 		}...)
 	if _, err := execIscsiadmCommand(ctx, loginTimeOutArgs...); err != nil {
 		Logc(ctx).Error("Error running iscsiadm set login timeout.")
@@ -1304,8 +1385,13 @@ func loginISCSITarget(ctx context.Context, publishInfo *VolumePublishInfo, porta
 	}
 
 	loginArgs := append(args, []string{"--login"}...)
-	if _, err := execIscsiadmCommandWithTimeout(ctx, 10*time.Second, loginArgs...); err != nil {
+	if _, err := execIscsiadmCommandWithTimeout(ctx, iscsiadmLoginTimeout, loginArgs...); err != nil {
 		Logc(ctx).WithField("error", err).Error("Error logging in to iSCSI target.")
+		exitErr, ok := err.(*exec.ExitError)
+		if ok && exitErr.ProcessState.Sys().(syscall.WaitStatus).ExitStatus() == ISCSIErrLoginAuthFailed {
+			return AuthError("iSCSI login failed: CHAP authorization failure")
+		}
+
 		return err
 	}
 	listAllISCSIDevices(ctx)
@@ -1341,6 +1427,14 @@ func EnsureISCSISessions(ctx context.Context, publishInfo *VolumePublishInfo, po
 				"iface":     publishInfo.IscsiInterface,
 				"err":       err,
 			}).Errorf("unable to ensure iSCSI target exists: %v", err)
+
+			if !loginFailedDueToChap {
+				if IsAuthError(err) {
+					Logc(ctx).Debug("Unable to ensure iSCSI target exists - authorization failed using CHAP")
+					loginFailedDueToChap = true
+				}
+			}
+
 			continue
 		}
 
@@ -1363,14 +1457,13 @@ func EnsureISCSISessions(ctx context.Context, publishInfo *VolumePublishInfo, po
 		}
 
 		// Log in to target
-		if err := loginISCSITarget(ctx, publishInfo, portal); err != nil {
+		if err := LoginISCSITarget(ctx, publishInfo, portal); err != nil {
 			Logc(ctx).WithFields(log.Fields{
 				"err":      err,
 				"portalIP": portal,
 			}).Error("Login to iSCSI target failed.")
 			if !loginFailedDueToChap {
-				exitErr, ok := err.(*exec.ExitError)
-				if ok && exitErr.ProcessState.Sys().(syscall.WaitStatus).ExitStatus() == iSCSIErrLoginAuthFailed {
+				if IsAuthError(err) {
 					Logc(ctx).Debug("iSCSI login failed - authorization failed using CHAP")
 					loginFailedDueToChap = true
 				}
@@ -1488,7 +1581,7 @@ func EnsureISCSISessionWithPortalDiscovery(ctx context.Context, hostDataIP strin
 				publishInfo := &VolumePublishInfo{}
 				publishInfo.UseCHAP = false
 				publishInfo.IscsiTargetIQN = target.TargetName
-				err = loginISCSITarget(ctx, publishInfo, target.PortalIP)
+				err = LoginISCSITarget(ctx, publishInfo, target.PortalIP)
 				if err != nil {
 					return fmt.Errorf("login to iSCSI target failed: %v", err)
 				}
@@ -1501,7 +1594,7 @@ func EnsureISCSISessionWithPortalDiscovery(ctx context.Context, hostDataIP strin
 			return fmt.Errorf("could not recheck for iSCSI session: %v", err)
 		}
 		if !sessionExists {
-			return fmt.Errorf("Expected iSCSI session %v NOT found, please login to the iSCSI portal", hostDataIP)
+			return fmt.Errorf("expected iSCSI session %v NOT found, please login to the iSCSI portal", hostDataIP)
 		}
 	}
 
@@ -1578,9 +1671,9 @@ func identifyFindMultipathsValue(ctx context.Context) (string, error) {
 	}
 }
 
-// iSCSIPreChecks to check if all the required tools are present and configured correctly for the  volume
+// ISCSIPreChecks to check if all the required tools are present and configured correctly for the  volume
 // attachment to go through
-func iSCSIPreChecks(ctx context.Context) error {
+func ISCSIPreChecks(ctx context.Context) error {
 	if !ISCSISupported(ctx) {
 		err := errors.New("unable to attach: open-iscsi tools not found on host")
 		return err
@@ -1596,6 +1689,538 @@ func iSCSIPreChecks(ctx context.Context) error {
 			return fmt.Errorf("multipathd: unsupported find_multipaths: %s value;"+
 				" please set the value to no in /etc/multipath.conf file", findMultipathsValue)
 		}
+	}
+
+	return nil
+}
+
+// ReconcileISCSIVolumeInfo returns true if any of the expected conditions for a present volume are true (e.g. the
+// expected LUN exists).
+func (h *IscsiReconcileHelper) ReconcileISCSIVolumeInfo(
+	ctx context.Context, trackingInfo *VolumeTrackingInfo,
+) (bool, error) {
+	pubInfo := trackingInfo.VolumePublishInfo
+	lun := int(pubInfo.IscsiLunNumber)
+	iqn := pubInfo.IscsiTargetIQN
+
+	sessionMap := IscsiUtils.GetISCSIHostSessionMapForTarget(ctx, iqn)
+	if len(sessionMap) > 0 {
+		return true, nil
+	}
+
+	paths := IscsiUtils.GetSysfsBlockDirsForLUN(lun, sessionMap)
+	devices, err := IscsiUtils.GetDevicesForLUN(paths)
+	if err != nil {
+		return false, err
+	}
+	if len(devices) > 0 {
+		return true, nil
+	}
+
+	return false, nil
+}
+
+// IsISCSISessionStale - reads /sys/class/iscsi_session/session<sid>/state and returns true if it is not "LOGGED_IN".
+// Looks that the state of an already established session to identify if it is
+// logged in or not, if it is not logged in then it could be a stale session.
+// For now, we are relying on the sysfs files
+func IsISCSISessionStale(ctx context.Context, sessionID string) bool {
+	Logc(ctx).WithField("sessionID", sessionID).Debug(">>>> iscsi.IsISCSISessionStale")
+	defer Logc(ctx).Debug("<<<< iscsi.IsISCSISessionStale")
+
+	// Find the session state from the session at /sys/class/iscsi_session/sessionXXX/state
+	filename := fmt.Sprintf(chrootPathPrefix+"/sys/class/iscsi_session/session%s/state", sessionID)
+	sessionStateBytes, err := ioutil.ReadFile(filename)
+	if err != nil {
+		Logc(ctx).WithFields(log.Fields{
+			"path":  filename,
+			"error": err,
+		}).Error("Could not read session state file")
+		return false
+	}
+
+	sessionState := strings.TrimSpace(string(sessionStateBytes))
+
+	Logc(ctx).WithFields(log.Fields{
+		"sessionID":    sessionID,
+		"sessionState": sessionState,
+		"sysfsFile":    filename,
+	}).Debug("Found iSCSI session state.")
+
+	return sessionState != iSCSISessionStateLoggedIn
+}
+
+// InitiateScanForLuns scans all paths to each of the LUNs passed.
+func InitiateScanForLuns(ctx context.Context, luns []int32, iSCSINodeName string) error {
+	fields := log.Fields{
+		"lunIDs":        luns,
+		"iSCSINodeName": iSCSINodeName,
+	}
+	Logc(ctx).WithFields(fields).Debug(">>>> iscsi.InitiateScanForLuns")
+	defer Logc(ctx).WithFields(fields).Debug("<<<< iscsi.InitiateScanForLuns")
+
+	hostSessionMap := IscsiUtils.GetISCSIHostSessionMapForTarget(ctx, iSCSINodeName)
+	if len(hostSessionMap) == 0 {
+		return fmt.Errorf("no iSCSI hosts found for target %s", iSCSINodeName)
+	}
+
+	Logc(ctx).WithField("hostSessionMap", hostSessionMap).Debug("Built iSCSI host/session map.")
+	hosts := make([]int, 0)
+	for hostNumber := range hostSessionMap {
+		hosts = append(hosts, hostNumber)
+	}
+
+	for _, lun := range luns {
+		if err := iSCSIScanTargetLUN(ctx, int(lun), hosts); err != nil {
+			Logc(ctx).WithField("scanError", err).Error("Could not scan for new LUN.")
+		}
+	}
+
+	return nil
+}
+
+// RemoveLUNFromSessions removes portal LUN mappings
+func RemoveLUNFromSessions(ctx context.Context, publishInfo *VolumePublishInfo, sessions *ISCSISessions) {
+	if sessions == nil || len(sessions.Info) == 0 {
+		Logc(ctx).Debug("No sessions found, nothing to remove.")
+		return
+	}
+
+	lunNumber := publishInfo.IscsiLunNumber
+	allPortals := append(publishInfo.IscsiPortals, publishInfo.IscsiTargetPortal)
+	for _, portal := range allPortals {
+		sessions.RemoveLUNFromPortal(portal, lunNumber)
+	}
+}
+
+// RemovePortalsFromSession removes portals from portal LUN mapping
+func RemovePortalsFromSession(ctx context.Context, publishInfo *VolumePublishInfo, sessions *ISCSISessions) {
+	if sessions == nil || len(sessions.Info) == 0 {
+		Logc(ctx).Debug("No sessions found, nothing to remove.")
+		return
+	}
+
+	allPortals := append(publishInfo.IscsiPortals, publishInfo.IscsiTargetPortal)
+	for _, portal := range allPortals {
+		sessions.RemovePortal(portal)
+	}
+}
+
+// AddISCSISession adds a portal and LUN data to the session map. Extracts the
+// required iSCSI Target IQN, CHAP Credentials if any from the provided VolumePublishInfo and
+// populates the map against the portal.
+// NOTE: sessionNumber should only be passed if there is only one portal/targetportal entry in publishInfo.
+func AddISCSISession(ctx context.Context, sessions *ISCSISessions, publishInfo *VolumePublishInfo,
+	volID, sessionNumber string, reasonInvalid PortalInvalid,
+) {
+	if sessions == nil {
+		// Initialize and use it
+		sessions = &ISCSISessions{Info: make(map[string]*ISCSISessionData)}
+	}
+
+	iSCSITargetIQN := publishInfo.IscsiTargetIQN
+
+	// Check if TargetIQN is empty
+	if reasonInvalid == NotInvalid {
+		if iSCSITargetIQN == "" {
+			Logc(ctx).Errorf("Portal '%v' is missing target IQN; it may not be considered for iSCSI self-healing.",
+				publishInfo.IscsiTargetPortal)
+			reasonInvalid = MissingTargetIQN
+		}
+	}
+
+	// Check if TargetIQN contains keywords that is part of the exclusion list
+	for _, keyword := range iSCSISelfHealingExclusion {
+		if strings.Contains(iSCSITargetIQN, keyword) {
+			Logc(ctx).Errorf("Failed to add portal %v to self-healing map; target IQN '%v' contains `%v` keyword",
+				publishInfo.IscsiTargetPortal, iSCSITargetIQN, keyword)
+			return
+		}
+	}
+
+	newLUNData := LUNData{
+		LUN:   publishInfo.IscsiLunNumber,
+		VolID: volID,
+	}
+
+	// Capture the source of the session information
+	var source string
+	if ctxSource := ctx.Value(SessionInfoSource); ctxSource != nil {
+		source = fmt.Sprintf("%v", ctxSource)
+	}
+
+	// Extract required portal info
+	credentials := IscsiChapInfo{
+		UseCHAP:              publishInfo.UseCHAP,
+		IscsiUsername:        publishInfo.IscsiUsername,
+		IscsiInitiatorSecret: publishInfo.IscsiInitiatorSecret,
+		IscsiTargetUsername:  publishInfo.IscsiTargetUsername,
+		IscsiTargetSecret:    publishInfo.IscsiTargetSecret,
+	}
+	portalInfo := PortalInfo{
+		ISCSITargetIQN:         publishInfo.IscsiTargetIQN,
+		Credentials:            credentials,
+		LastAccessTime:         time.Time{},
+		FirstIdentifiedStaleAt: time.Time{},
+		SessionNumber:          sessionNumber,
+		ReasonInvalid:          reasonInvalid,
+		Source:                 source,
+	}
+
+	allPortals := append(publishInfo.IscsiPortals, publishInfo.IscsiTargetPortal)
+	for _, portal := range allPortals {
+
+		if !sessions.CheckPortalExists(portal) {
+			if err := sessions.AddPortal(portal, portalInfo); err != nil {
+				Logc(ctx).Errorf("Failed to add portal %v to self-healing map; err: %v", portal, err)
+				continue
+			}
+		} else {
+			if portalUpdates, err := sessions.UpdateAndRecordPortalInfoChanges(portal, portalInfo); err != nil {
+				Logc(ctx).Errorf("Failed to update portal %v in self-healing map; err: %v", portal, err)
+				continue
+			} else if portalUpdates != "" {
+				Logc(ctx).Debugf("Changes to portal %v: %v", portal, portalUpdates)
+			}
+		}
+
+		if err := sessions.AddLUNToPortal(portal, newLUNData); err != nil {
+			Logc(ctx).Errorf("Failed to add LUN %v to portal %v in self-healing map; err:  %v", newLUNData, portal, err)
+		}
+	}
+}
+
+func PopulateCurrentSessions(ctx context.Context, currentMapping *ISCSISessions) error {
+	sessionInfos, err := getISCSISessionInfo(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get iSCSI session information")
+	}
+
+	// List of duplicate portals that can cause issues for self-healing should be excluded.
+	var duplicatePortals []string
+
+	sessionIDToPortalMapping := make(map[string]string, 0)
+	portals := make(map[string]interface{}, 0)
+	for _, sessionInfo := range sessionInfos {
+		sessionIDToPortalMapping[sessionInfo.SID] = sessionInfo.PortalIP
+
+		// Identify portals that may appear more than once in self-healing
+		if _, found := portals[sessionInfo.PortalIP]; found {
+			Logc(ctx).WithField("portal", sessionInfo.PortalIP).Warning(
+				"More than one session found for portal; Portal will be excluded from iSCSI self-healing.")
+			duplicatePortals = append(duplicatePortals, sessionInfo.PortalIP)
+		} else {
+			portals[sessionInfo.PortalIP] = new(interface{})
+		}
+	}
+
+	// Get all known iSCSI devices
+	iscsiDevices, err := GetISCSIDevices(ctx, true)
+	if err != nil {
+		Logc(ctx).WithField("error", err).Error("Failed to get list of iSCSI devices.")
+		return err
+	}
+
+	if iscsiDevices == nil || len(iscsiDevices) == 0 {
+		Logc(ctx).Debug("No iSCSI devices found.")
+	}
+
+	for _, iscsiDevice := range iscsiDevices {
+
+		logFields := log.Fields{
+			"sessionNumber":   iscsiDevice.SessionNumber,
+			"multipathDevice": iscsiDevice.MultipathDevice,
+			"targetIQN":       iscsiDevice.IQN,
+		}
+
+		lunNumber, err := strconv.ParseInt(iscsiDevice.LUN, 10, 0)
+		if err != nil {
+			logFields["error"] = err
+			Logc(ctx).WithFields(logFields).Error("Unable to convert LUN to int value.")
+			continue
+		}
+
+		sessionNumber := strconv.Itoa(iscsiDevice.SessionNumber)
+		targetPortal, ok := sessionIDToPortalMapping[sessionNumber]
+		if !ok {
+			Logc(ctx).WithFields(logFields).Error("Unable to find session information for session.")
+			continue
+		}
+
+		var publishInfo VolumePublishInfo
+		publishInfo.IscsiAccessInfo = IscsiAccessInfo{
+			IscsiLunNumber:    int32(lunNumber),
+			IscsiTargetIQN:    iscsiDevice.IQN,
+			IscsiTargetPortal: targetPortal,
+		}
+		publishInfo.IscsiChapInfo = iscsiDevice.CHAPInfo
+
+		logFields["IscsiPortal"] = targetPortal
+
+		reasonInvalid := NotInvalid
+		if SliceContainsString(duplicatePortals, targetPortal) {
+			Logc(ctx).WithFields(logFields).Warning("Portal value is not unique.")
+
+			reasonInvalid = DuplicatePortals // Could be a result of bug in open-iscsi
+		} else if iscsiDevice.MultipathDevice == "" {
+			Logc(ctx).WithFields(logFields).Warning("Multipath device not found.")
+
+			reasonInvalid = MissingMpathDevice // Could be a result of previous invalid multipathing config
+		}
+
+		newCtx := context.WithValue(ctx, SessionInfoSource, SessionSourceCurrentStatus)
+		AddISCSISession(newCtx, currentMapping, &publishInfo, "", sessionNumber, reasonInvalid)
+	}
+
+	return nil
+}
+
+// InspectAllISCSISessions goes through each iSCSI session in published sessions and creates a list of
+// sorted stale iSCSI portals and a sorted list of non-stale iSCSI portals.
+// NOTE: Since we do not expect notStalePortals to be very-large (in millions or even in 1000s),
+// sorting on the basis of lastAccessTime should not be an expensive operation.
+func InspectAllISCSISessions(ctx context.Context, publishedSessions, currentSessions *ISCSISessions,
+	iSCSISessionWaitTime time.Duration,
+) ([]string, []string) {
+	timeNow := time.Now()
+	Logc(ctx).Debugf("Inspecting iSCSI sessions at %v", timeNow)
+
+	if publishedSessions.IsEmpty() {
+		Logc(ctx).Debug("Skipping session inspection; no published iSCSI sessions found.")
+		return nil, nil
+	}
+
+	noCurrentSessionExists := currentSessions.IsEmpty()
+	if noCurrentSessionExists {
+		Logc(ctx).Debug("No current iSCSI session found.")
+	}
+
+	var candidateStalePortals, candidateNonStalePortal []string
+
+	for portal, publishedSessionData := range publishedSessions.Info {
+
+		logFields := log.Fields{"portal": portal}
+
+		var publishedPortalInfo, currentPortalInfo *PortalInfo
+
+		// GET publishedSessionData and publishedPortalInfo
+		if publishedSessionData == nil {
+			Logc(ctx).WithFields(logFields).Warning(
+				"Ignoring portal; published sessions is missing portal's session data.")
+			continue
+		}
+
+		if !publishedSessionData.PortalInfo.HasTargetIQN() {
+			Logc(ctx).WithFields(logFields).Warning(
+				"Ignoring portal; published session's data is missing portal's target IQN.")
+			continue
+		}
+		publishedPortalInfo = &publishedSessionData.PortalInfo
+
+		if noCurrentSessionExists {
+			Logc(ctx).WithFields(logFields).Debugf("Portal requires %v; no current session found.", LoginScan)
+			publishedSessionData.Remediation = LoginScan
+
+			candidateNonStalePortal = append(candidateNonStalePortal, portal)
+			continue
+		}
+
+		// GET currentSessionData and currentPortalInfo
+		currentSessionData, err := currentSessions.ISCSISessionData(portal)
+		if err != nil {
+			if IsNotFoundError(err) {
+				Logc(ctx).WithFields(logFields).Warning("Portal is missing from the current sessions.")
+				publishedSessionData.Remediation = LoginScan
+
+				candidateNonStalePortal = append(candidateNonStalePortal, portal)
+			} else {
+				Logc(ctx).WithFields(logFields).Error("Unable to get current session information.")
+			}
+			continue
+		} else if currentSessionData == nil {
+			Logc(ctx).WithFields(logFields).Warning("Ignoring portal; current session(s) are missing information.")
+			continue
+		}
+		currentPortalInfo = &currentSessionData.PortalInfo
+
+		// Run some validation to ensure currentPortalInfo is not missing any key information and is valid
+		if !currentPortalInfo.HasTargetIQN() {
+			Logc(ctx).WithFields(logFields).Warning("Ignoring portal; current session data is missing portal's target IQN.")
+			continue
+		} else if !currentPortalInfo.IsValid() {
+			Logc(ctx).WithFields(logFields).Warningf("Ignoring portal; current session data is invalid: %v",
+				currentPortalInfo.ReasonInvalid)
+			continue
+		} else if publishedPortalInfo.ISCSITargetIQN != currentPortalInfo.ISCSITargetIQN {
+			// Should never be here
+			Logc(ctx).WithFields(logFields).Warningf(
+				"Ignoring portal; published session's target IQN '%v' does not match current session's target IQN '%v'",
+				publishedPortalInfo.ISCSITargetIQN, currentPortalInfo.ISCSITargetIQN)
+			continue
+		}
+
+		// At this stage we know Session exists, based on the session number from current session data
+		// we can identify if the session is logged in or not (stale state).
+		// If stale, an attempt is made to identify if the session should be fixed right now or there is a need to wait.
+		if IsISCSISessionStale(ctx, currentPortalInfo.SessionNumber) {
+			action := isStalePortal(ctx, publishedPortalInfo, currentPortalInfo, iSCSISessionWaitTime, timeNow, portal)
+			publishedSessionData.Remediation = action
+
+			if action != NoAction {
+				candidateStalePortals = append(candidateStalePortals, portal)
+			}
+			continue
+		}
+
+		// If session is not stale anymore ensure portal's FirstIdentifiedStaleAt value is reset
+		if publishedPortalInfo.IsFirstIdentifiedStaleAtSet() {
+			Logc(ctx).WithFields(logFields).Debug("Portal not stale anymore.")
+			publishedPortalInfo.ResetFirstIdentifiedStaleAt()
+		}
+
+		action := isNonStalePortal(ctx, publishedSessionData, currentSessionData, portal)
+		publishedSessionData.Remediation = action
+
+		if action != NoAction {
+			candidateNonStalePortal = append(candidateNonStalePortal, portal)
+		} else {
+			// The reason we update the last access time for healthy portals here is to ensure these portals
+			// do not get higher priority in the next cycle (in case these go bad).
+			Logc(ctx).WithFields(logFields).Debug("Portal requires no remediation.")
+			publishedPortalInfo.LastAccessTime = timeNow
+		}
+	}
+
+	// Sort portals based on last access time
+	SortPortals(candidateStalePortals, publishedSessions)
+	SortPortals(candidateNonStalePortal, publishedSessions)
+
+	return candidateStalePortals, candidateNonStalePortal
+}
+
+// isStalePortal attempts to identify if a session should be immediately fixed or not using published
+// and current credentials or based on iSCSI session wait timer.
+// For CHAP: It first inspects published sessions and compare CHAP credentials with current in-use
+//           CHAP credentials, if different it returns true, else we wait until session exceeds
+//           iSCSISessionWaitTime that is the CHAP & non-CHAP scenario. For this logic to work correct
+//           ensure last portal update came from NodeStage and not from Tracking Info.
+// FOR CHAP & non-CHAP:
+// 1. If the FirstIdentifiedStaleAt is not set, set it; else
+// 2. Compare timeNow with the FirstIdentifiedStaleAt; if it exceeds iSCSISessionWaitTime then it returns true;
+// 3. Else do nothing and continue
+func isStalePortal(ctx context.Context, publishedPortalInfo, currentPortalInfo *PortalInfo,
+	iSCSISessionWaitTime time.Duration, timeNow time.Time, portal string,
+) ISCSIAction {
+	logFields := log.Fields{
+		"portal":            portal,
+		"CHAPInUse":         publishedPortalInfo.CHAPInUse(),
+		"sessionInfoSource": publishedPortalInfo.Source,
+	}
+
+	// The reason we can rely on CHAP information from NodeStage and not from TrackingInfo is that
+	// the multiple tracking information may contain different CHAP credentials for the same
+	// portal and they may be read in any sequence.
+	if publishedPortalInfo.CHAPInUse() && publishedPortalInfo.Source == SessionSourceNodeStage {
+		if publishedPortalInfo.Credentials != currentPortalInfo.Credentials {
+			Logc(ctx).WithFields(logFields).Warning("Portal's published credentials do not match current credentials" +
+				" in-use.")
+			return LogoutLoginScan
+		}
+	}
+
+	if !publishedPortalInfo.IsFirstIdentifiedStaleAtSet() {
+		Logc(ctx).WithFields(logFields).Warningf("Portal identified to be stale at %v.", timeNow)
+		publishedPortalInfo.FirstIdentifiedStaleAt = timeNow
+	} else if timeNow.Sub(publishedPortalInfo.FirstIdentifiedStaleAt) >= iSCSISessionWaitTime {
+		Logc(ctx).WithFields(logFields).Warningf("Portal exceeded stale wait time at %v; adding to stale portals list.",
+			timeNow)
+		return LogoutLoginScan
+	} else {
+		Logc(ctx).WithFields(logFields).Warningf("Portal has not exceeded stale wait time at %v.", timeNow)
+	}
+
+	return NoAction
+}
+
+// isNonStalePortal attempts to identify if a session has any issues other than being stale.
+// For sessions with no current issues it attempts to identify any strange behavior or state it should
+// not be in.
+func isNonStalePortal(ctx context.Context, publishedSessionData, currentSessionData *ISCSISessionData,
+	portal string,
+) ISCSIAction {
+	logFields := log.Fields{
+		"portal":            portal,
+		"CHAPInUse":         publishedSessionData.PortalInfo.CHAPInUse(),
+		"sessionInfoSource": publishedSessionData.PortalInfo.Source,
+	}
+
+	// Identify if LUNs in published sessions are missing from the current sessions
+	publishedLUNs := publishedSessionData.LUNs
+	if missingLUNs := currentSessionData.LUNs.IdentifyMissingLUNs(publishedLUNs); len(missingLUNs) > 0 {
+		Logc(ctx).WithFields(logFields).Warningf("Portal is missing LUN Number(s): %v.", missingLUNs)
+		return Scan
+	}
+
+	// Additional checks are for informational purposes only - no immediate action required.
+
+	// Verify CHAP credentials are not stale, for this logic to work correct ensure last portal
+	// update came from NodeStage and not from Tracking Info.
+	if publishedSessionData.PortalInfo.Source == SessionSourceNodeStage {
+		if publishedSessionData.PortalInfo.CHAPInUse() {
+			if !currentSessionData.PortalInfo.CHAPInUse() {
+				Logc(ctx).WithFields(logFields).Warning("Portal should be using CHAP.")
+			} else if publishedSessionData.PortalInfo.Credentials != currentSessionData.PortalInfo.Credentials {
+				Logc(ctx).WithFields(logFields).Warning("Portal may have stale CHAP credentials.")
+			}
+		} else {
+			if currentSessionData.PortalInfo.CHAPInUse() {
+				Logc(ctx).WithFields(logFields).Warning("Portal should not be using CHAP.")
+			}
+		}
+	}
+
+	return NoAction
+}
+
+// SortPortals sorts portals on the basis of their lastAccessTime
+func SortPortals(portals []string, publishedSessions *ISCSISessions) {
+	if len(portals) > 1 {
+		sort.Slice(portals, func(i, j int) bool {
+			// Get last access time from publish info for both
+			iPortal := portals[i]
+			jPortal := portals[j]
+
+			iLastAccessTime := publishedSessions.Info[iPortal].PortalInfo.LastAccessTime
+			jLastAccessTime := publishedSessions.Info[jPortal].PortalInfo.LastAccessTime
+
+			return iLastAccessTime.Before(jLastAccessTime)
+		})
+	}
+}
+
+// InitiateScanForAllLUNs scans all paths to each of the LUNs passed.
+func InitiateScanForAllLUNs(ctx context.Context, iSCSINodeName string) error {
+	fields := log.Fields{"iSCSINodeName": iSCSINodeName}
+
+	Logc(ctx).WithFields(fields).Debug(">>>> iscsi.InitiateScanForAllLUNs")
+	defer Logc(ctx).WithFields(fields).Debug("<<<< iscsi.InitiateScanForAllLUNs")
+
+	// Setting lunID to -1 so that all the LUNs are scanned.
+	lunID := -1
+
+	hostSessionMap := IscsiUtils.GetISCSIHostSessionMapForTarget(ctx, iSCSINodeName)
+	if len(hostSessionMap) == 0 {
+		return fmt.Errorf("no iSCSI hosts found for target %s", iSCSINodeName)
+	}
+
+	Logc(ctx).WithField("hostSessionMap", hostSessionMap).Debug("Built iSCSI host/session map.")
+	hosts := make([]int, 0)
+	for hostNumber := range hostSessionMap {
+		hosts = append(hosts, hostNumber)
+	}
+
+	if err := iSCSIScanTargetLUN(ctx, lunID, hosts); err != nil {
+		Logc(ctx).WithError(err).Error("Could not scan for new LUN.")
 	}
 
 	return nil

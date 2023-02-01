@@ -21,6 +21,15 @@ func getRBACResourceNames() []string {
 	return names
 }
 
+func getNodeResourceNames() []string {
+	var resourceNames []string
+	resourceNames = append(resourceNames, TridentNodeLinuxResourceName)
+	if windows {
+		resourceNames = append(resourceNames, TridentNodeWindowsResourceName)
+	}
+	return resourceNames
+}
+
 func getClusterRoleName(csi bool) string {
 	if csi {
 		return TridentCSI
@@ -73,7 +82,7 @@ func getNodeRBACResourceName(windows bool) string {
 
 func getDeploymentName(csi bool) string {
 	if csi {
-		return TridentCSI
+		return TridentDeploymentName
 	} else {
 		return TridentLegacy
 	}
@@ -81,9 +90,9 @@ func getDeploymentName(csi bool) string {
 
 func getDaemonSetName(windows bool) string {
 	if windows {
-		return TridentCSIWindows
+		return TridentWindowsDaemonsetName
 	} else {
-		return TridentCSI
+		return TridentLinuxDaemonsetName
 	}
 }
 

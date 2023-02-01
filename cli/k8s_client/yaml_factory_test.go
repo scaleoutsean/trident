@@ -100,6 +100,10 @@ func TestYAMLFactory(t *testing.T) {
 	yamlsOutputs := []string{
 		GetServiceAccountYAML(Name, nil, nil, nil),
 		GetServiceAccountYAML(Name, Secrets, labels, ownerRef),
+		GetRoleYAML(FlavorK8s, Namespace, Name, labels, ownerRef, false),
+		GetRoleYAML(FlavorOpenshift, Namespace, Name, labels, ownerRef, true),
+		GetRoleBindingYAML(FlavorK8s, Namespace, Name, labels, ownerRef, false),
+		GetRoleBindingYAML(FlavorOpenshift, Namespace, Name, labels, ownerRef, true),
 		GetClusterRoleYAML(FlavorK8s, Name, nil, nil, false),
 		GetClusterRoleYAML(FlavorOpenshift, Name, labels, ownerRef, true),
 		GetClusterRoleBindingYAML(Namespace, Name, FlavorOpenshift, nil, ownerRef, false),
@@ -120,14 +124,17 @@ func TestYAMLFactory(t *testing.T) {
 // TestAPIVersion validates that we get correct APIVersion value
 func TestAPIVersion(t *testing.T) {
 	yamlsOutputs := map[string]string{
-		GetClusterRoleYAML(FlavorK8s, Name, nil, nil, false):                         "rbac.authorization.k8s.io/v1",
-		GetClusterRoleYAML(FlavorK8s, Name, nil, nil, true):                          "rbac.authorization.k8s.io/v1",
-		GetClusterRoleYAML(FlavorOpenshift, Name, nil, nil, false):                   "authorization.openshift.io/v1",
-		GetClusterRoleYAML(FlavorOpenshift, Name, nil, nil, true):                    "rbac.authorization.k8s.io/v1",
-		GetClusterRoleBindingYAML(Namespace, Name, FlavorK8s, nil, nil, false):       "rbac.authorization.k8s.io/v1",
-		GetClusterRoleBindingYAML(Namespace, Name, FlavorK8s, nil, nil, true):        "rbac.authorization.k8s.io/v1",
-		GetClusterRoleBindingYAML(Namespace, Name, FlavorOpenshift, nil, nil, false): "authorization.openshift.io/v1",
-		GetClusterRoleBindingYAML(Namespace, Name, FlavorOpenshift, nil, nil, true):  "rbac.authorization.k8s.io/v1",
+		GetClusterRoleYAML(FlavorK8s, Name, nil, nil, true):                         "rbac.authorization.k8s.io/v1",
+		GetClusterRoleYAML(FlavorOpenshift, Name, nil, nil, true):                   "rbac.authorization.k8s.io/v1",
+		GetRoleYAML(FlavorK8s, Namespace, Name, nil, nil, false):                    "rbac.authorization.k8s.io/v1",
+		GetRoleYAML(FlavorK8s, Namespace, Name, nil, nil, true):                     "rbac.authorization.k8s.io/v1",
+		GetRoleYAML(FlavorOpenshift, Namespace, Name, nil, nil, true):               "rbac.authorization.k8s.io/v1",
+		GetRoleBindingYAML(FlavorK8s, Namespace, Name, nil, nil, false):             "rbac.authorization.k8s.io/v1",
+		GetRoleBindingYAML(FlavorK8s, Namespace, Name, nil, nil, true):              "rbac.authorization.k8s.io/v1",
+		GetRoleBindingYAML(FlavorOpenshift, Namespace, Name, nil, nil, true):        "rbac.authorization.k8s.io/v1",
+		GetClusterRoleBindingYAML(Namespace, Name, FlavorK8s, nil, nil, false):      "rbac.authorization.k8s.io/v1",
+		GetClusterRoleBindingYAML(Namespace, Name, FlavorK8s, nil, nil, true):       "rbac.authorization.k8s.io/v1",
+		GetClusterRoleBindingYAML(Namespace, Name, FlavorOpenshift, nil, nil, true): "rbac.authorization.k8s.io/v1",
 	}
 
 	for result, value := range yamlsOutputs {
@@ -146,7 +153,7 @@ func TestValidateGetCSIDeploymentYAMLSuccess(t *testing.T) {
 
 	imagePullSecrets := []string{"thisisasecret"}
 
-	version := utils.MustParseSemantic("1.20.0")
+	version := utils.MustParseSemantic("1.26.0")
 
 	deploymentArgs := &DeploymentYAMLArguments{
 		DeploymentName:          "trident-csi",
@@ -193,7 +200,7 @@ func TestValidateGetCSIDeploymentYAMLFail(t *testing.T) {
 
 	imagePullSecrets := []string{"thisisasecret"}
 
-	version := utils.MustParseSemantic("1.20.0")
+	version := utils.MustParseSemantic("1.26.0")
 
 	deploymentArgs := &DeploymentYAMLArguments{
 		DeploymentName:          "\ntrident-csi",
@@ -351,6 +358,54 @@ func TestGetCSIDeploymentYAMLTolerations(t *testing.T) {
 		fmt.Sprintf("expected default tolerations to not appear in final YAML: %s", yamlData))
 }
 
+func TestGetCSIDeploymentYAMLImagePullPolicy(t *testing.T) {
+	versions := []string{"1.26.0"}
+	expectedStr := `imagePullPolicy: %s`
+
+	expectedIfNotPresent := fmt.Sprintf(expectedStr, v1.PullIfNotPresent)
+	expectedAlways := fmt.Sprintf(expectedStr, v1.PullAlways)
+	expectedNever := fmt.Sprintf(expectedStr, v1.PullNever)
+
+	type Args struct {
+		imagePullPolicy string
+		Expected        string
+		FailStr         string
+	}
+
+	testArgs := []*Args{
+		{
+			imagePullPolicy: string(v1.PullIfNotPresent),
+			Expected:        expectedIfNotPresent,
+			FailStr:         string(v1.PullIfNotPresent),
+		},
+		{
+			imagePullPolicy: string(v1.PullAlways),
+			Expected:        expectedAlways,
+			FailStr:         string(v1.PullAlways),
+		},
+		{
+			imagePullPolicy: string(v1.PullNever),
+			Expected:        expectedNever,
+			FailStr:         string(v1.PullNever),
+		},
+	}
+
+	for _, args := range testArgs {
+		for _, versionString := range versions {
+			version := utils.MustParseSemantic(versionString)
+			daemonsetArgs := &DeploymentYAMLArguments{Version: version, ImagePullPolicy: args.imagePullPolicy}
+
+			yamlData := GetCSIDeploymentYAML(daemonsetArgs)
+			_, err := yaml.YAMLToJSON([]byte(yamlData))
+			if err != nil {
+				t.Fatalf("expected valid YAML for version %s", versionString)
+			}
+			failMsg := fmt.Sprintf("expected imagPullPolicy to be %s in final YAML: %s", args.FailStr, yamlData)
+			assert.Contains(t, yamlData, args.Expected, failMsg)
+		}
+	}
+}
+
 func TestGetCSIDaemonSetYAMLLinux(t *testing.T) {
 	versions := []string{"1.21.0", "1.23.0", "1.25.0"}
 
@@ -377,6 +432,105 @@ func TestGetCSIDaemonSetYAMLLinux_DebugIsTrue(t *testing.T) {
 		_, err := yaml.YAMLToJSON([]byte(yamlData))
 		if err != nil {
 			t.Fatalf("expected valid YAML for version %s", versionString)
+		}
+	}
+}
+
+func TestGetCSIDaemonSetYAMLLinux_ForceDetach(t *testing.T) {
+	versions := []string{"1.26.0"}
+	expectedStr := `- "--enable_force_detach=%s"`
+	disabled := "false"
+	enabled := "true"
+	expectedDisabled := fmt.Sprintf(expectedStr, disabled)
+	expectedEnabled := fmt.Sprintf(expectedStr, enabled)
+
+	type Args struct {
+		Enabled    bool
+		Expected   string
+		Unexpected string
+		FailStr    string
+		FailStr2   string
+	}
+
+	testArgs := []*Args{
+		{
+			Enabled:    false,
+			Expected:   expectedDisabled,
+			Unexpected: expectedEnabled,
+			FailStr:    disabled,
+			FailStr2:   enabled,
+		},
+		{
+			Enabled:    true,
+			Expected:   expectedEnabled,
+			Unexpected: expectedDisabled,
+			FailStr:    enabled,
+			FailStr2:   disabled,
+		},
+	}
+
+	for _, args := range testArgs {
+		for _, versionString := range versions {
+			version := utils.MustParseSemantic(versionString)
+			daemonsetArgs := &DaemonsetYAMLArguments{Version: version, EnableForceDetach: args.Enabled}
+
+			yamlData := GetCSIDaemonSetYAMLLinux(daemonsetArgs)
+			_, err := yaml.YAMLToJSON([]byte(yamlData))
+			if err != nil {
+				t.Fatalf("expected valid YAML for version %s", versionString)
+			}
+			failMsg := fmt.Sprintf("expected enableForceDetach to be %s in final YAML: %s", args.FailStr, yamlData)
+			assert.Contains(t, yamlData, args.Expected, failMsg)
+			failMsg2 := fmt.Sprintf("did not expect enableForceDetach to be %s in final YAML: %s", args.FailStr2, yamlData)
+			assert.NotContains(t, yamlData, args.Unexpected, failMsg2)
+		}
+	}
+}
+
+func TestGetCSIDaemonSetYAMLLinuxImagePullPolicy(t *testing.T) {
+	versions := []string{"1.26.0"}
+	expectedStr := `imagePullPolicy: %s`
+
+	expectedIfNotPresent := fmt.Sprintf(expectedStr, v1.PullIfNotPresent)
+	expectedAlways := fmt.Sprintf(expectedStr, v1.PullAlways)
+	expectedNever := fmt.Sprintf(expectedStr, v1.PullNever)
+
+	type Args struct {
+		imagePullPolicy string
+		Expected        string
+		FailStr         string
+	}
+
+	testArgs := []*Args{
+		{
+			imagePullPolicy: string(v1.PullIfNotPresent),
+			Expected:        expectedIfNotPresent,
+			FailStr:         string(v1.PullIfNotPresent),
+		},
+		{
+			imagePullPolicy: string(v1.PullAlways),
+			Expected:        expectedAlways,
+			FailStr:         string(v1.PullAlways),
+		},
+		{
+			imagePullPolicy: string(v1.PullNever),
+			Expected:        expectedNever,
+			FailStr:         string(v1.PullNever),
+		},
+	}
+
+	for _, args := range testArgs {
+		for _, versionString := range versions {
+			version := utils.MustParseSemantic(versionString)
+			daemonsetArgs := &DaemonsetYAMLArguments{Version: version, ImagePullPolicy: args.imagePullPolicy}
+
+			yamlData := GetCSIDaemonSetYAMLLinux(daemonsetArgs)
+			_, err := yaml.YAMLToJSON([]byte(yamlData))
+			if err != nil {
+				t.Fatalf("expected valid YAML for version %s", versionString)
+			}
+			failMsg := fmt.Sprintf("expected imagPullPolicy to be %s in final YAML: %s", args.FailStr, yamlData)
+			assert.Contains(t, yamlData, args.Expected, failMsg)
 		}
 	}
 }
@@ -515,7 +669,7 @@ func TestGetCSIDaemonSetYAMLWindows(t *testing.T) {
 		yamlData := GetCSIDaemonSetYAMLWindows(daemonsetArgs)
 		_, err := yaml.YAMLToJSON([]byte(yamlData))
 		if err != nil {
-			t.Fatalf("expected valid YAML for version %s", versionString)
+			t.Fatalf("expected valid YAML for version %s, error: %v", versionString, err)
 		}
 	}
 }
@@ -531,6 +685,54 @@ func TestGetCSIDaemonSetYAMLWindows_DebugIsFalse(t *testing.T) {
 		_, err := yaml.YAMLToJSON([]byte(yamlData))
 		if err != nil {
 			t.Fatalf("expected valid YAML for version %s", versionString)
+		}
+	}
+}
+
+func TestGetCSIDaemonSetYAMLWindowsImagePullPolicy(t *testing.T) {
+	versions := []string{"1.26.0"}
+	expectedStr := `imagePullPolicy: %s`
+
+	expectedIfNotPresent := fmt.Sprintf(expectedStr, string(v1.PullIfNotPresent))
+	expectedAlways := fmt.Sprintf(expectedStr, string(v1.PullAlways))
+	expectedNever := fmt.Sprintf(expectedStr, string(v1.PullNever))
+
+	type Args struct {
+		imagePullPolicy string
+		Expected        string
+		FailStr         string
+	}
+
+	testArgs := []*Args{
+		{
+			imagePullPolicy: string(v1.PullIfNotPresent),
+			Expected:        expectedIfNotPresent,
+			FailStr:         string(v1.PullIfNotPresent),
+		},
+		{
+			imagePullPolicy: string(v1.PullAlways),
+			Expected:        expectedAlways,
+			FailStr:         string(v1.PullAlways),
+		},
+		{
+			imagePullPolicy: string(v1.PullNever),
+			Expected:        expectedNever,
+			FailStr:         string(v1.PullNever),
+		},
+	}
+
+	for _, args := range testArgs {
+		for _, versionString := range versions {
+			version := utils.MustParseSemantic(versionString)
+			daemonsetArgs := &DaemonsetYAMLArguments{Version: version, ImagePullPolicy: args.imagePullPolicy}
+
+			yamlData := GetCSIDaemonSetYAMLWindows(daemonsetArgs)
+			_, err := yaml.YAMLToJSON([]byte(yamlData))
+			if err != nil {
+				t.Fatalf("expected valid YAML for version %s", versionString)
+			}
+			failMsg := fmt.Sprintf("expected imagPullPolicy to be %s in final YAML: %s", args.FailStr, yamlData)
+			assert.Contains(t, yamlData, args.Expected, failMsg)
 		}
 	}
 }
@@ -619,7 +821,7 @@ func TestGetTridentVersionPodYAML(t *testing.T) {
 	}
 
 	var actual v1.Pod
-	actualYAML := GetTridentVersionPodYAML(name, image, "service", secrets, labels, crdDetails)
+	actualYAML := GetTridentVersionPodYAML(name, image, "service", "IfNotPresent", secrets, labels, crdDetails)
 	assert.Nil(t, yaml.Unmarshal([]byte(actualYAML), &actual), "invalid YAML")
 	assert.True(t, reflect.DeepEqual(expected.TypeMeta, actual.TypeMeta))
 	assert.True(t, reflect.DeepEqual(expected.ObjectMeta, actual.ObjectMeta))
@@ -627,10 +829,10 @@ func TestGetTridentVersionPodYAML(t *testing.T) {
 }
 
 func TestGetOpenShiftSCCYAML(t *testing.T) {
-	sccName := "trident-scc"
-	user := "trident-installer"
+	sccName := "trident-node-linux"
+	user := "trident-node-linux"
 	namespace := "trident"
-	labels := map[string]string{"app": "controller.csi.trident.netapp.io"}
+	labels := map[string]string{"app": "node.csi.trident.netapp.io"}
 	crdDetails := map[string]string{"kind": "ReplicaSet"}
 	allowPrivilegeEscalation := true
 
@@ -641,12 +843,12 @@ func TestGetOpenShiftSCCYAML(t *testing.T) {
 		},
 		ObjectMeta: metav1.ObjectMeta{
 			Annotations: map[string]string{
-				"kubernetes.io/description": "trident-scc is a clone of the privileged built-in, " +
+				"kubernetes.io/description": "trident-node-linux is a clone of the privileged built-in, " +
 					"and is meant just for use with trident.",
 			},
-			Name: "trident-scc",
+			Name: "trident-node-linux",
 			Labels: map[string]string{
-				"app": "controller.csi.trident.netapp.io",
+				"app": "node.csi.trident.netapp.io",
 			},
 			OwnerReferences: []metav1.OwnerReference{
 				{
@@ -678,20 +880,20 @@ func TestGetOpenShiftSCCYAML(t *testing.T) {
 		SupplementalGroups: scc.SupplementalGroupsStrategyOptions{
 			Type: "RunAsAny",
 		},
-		Users:   []string{"system:serviceaccount:trident:trident-installer"},
+		Users:   []string{"system:serviceaccount:trident:trident-node-linux"},
 		Volumes: []scc.FSType{"hostPath", "downwardAPI", "projected", "emptyDir"},
 	}
 
 	var actual scc.SecurityContextConstraints
 
-	actualYAML := GetOpenShiftSCCYAML(sccName, user, namespace, labels, crdDetails)
+	actualYAML := GetOpenShiftSCCYAML(sccName, user, namespace, labels, crdDetails, true)
 	assert.Nil(t, yaml.Unmarshal([]byte(actualYAML), &actual), "invalid YAML")
 	assert.Equal(t, expected, actual)
 }
 
 func TestGetOpenShiftSCCYAML_UnprivilegedUser(t *testing.T) {
-	sccName := "trident-scc"
-	user := "root"
+	sccName := "trident-controller"
+	user := "trident-controller"
 	namespace := "trident"
 	labels := map[string]string{"app": "controller.trident.netapp.io"}
 	crdDetails := map[string]string{"kind": "ReplicaSet"}
@@ -704,9 +906,9 @@ func TestGetOpenShiftSCCYAML_UnprivilegedUser(t *testing.T) {
 		},
 		ObjectMeta: metav1.ObjectMeta{
 			Annotations: map[string]string{
-				"kubernetes.io/description": "trident-scc is a clone of the anyuid built-in, and is meant just for use with trident.",
+				"kubernetes.io/description": "trident-controller is a clone of the anyuid built-in, and is meant just for use with trident.",
 			},
-			Name: "trident-scc",
+			Name: "trident-controller",
 			Labels: map[string]string{
 				"app": "controller.trident.netapp.io",
 			},
@@ -740,13 +942,13 @@ func TestGetOpenShiftSCCYAML_UnprivilegedUser(t *testing.T) {
 		SupplementalGroups: scc.SupplementalGroupsStrategyOptions{
 			Type: "RunAsAny",
 		},
-		Users:   []string{"system:serviceaccount:trident:root"},
+		Users:   []string{"system:serviceaccount:trident:trident-controller"},
 		Volumes: []scc.FSType{"hostPath", "downwardAPI", "projected", "emptyDir"},
 	}
 
 	var actual scc.SecurityContextConstraints
 
-	actualYAML := GetOpenShiftSCCYAML(sccName, user, namespace, labels, crdDetails)
+	actualYAML := GetOpenShiftSCCYAML(sccName, user, namespace, labels, crdDetails, false)
 	assert.Nil(t, yaml.Unmarshal([]byte(actualYAML), &actual), "invalid YAML")
 	assert.True(t, reflect.DeepEqual(expected.TypeMeta, actual.TypeMeta))
 	assert.True(t, reflect.DeepEqual(expected.ObjectMeta, actual.ObjectMeta))

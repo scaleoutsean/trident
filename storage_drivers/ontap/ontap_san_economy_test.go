@@ -14,13 +14,13 @@ import (
 	"github.com/golang/mock/gomock"
 	"github.com/google/uuid"
 
+	log "github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/assert"
+
 	mockapi "github.com/netapp/trident/mocks/mock_storage_drivers/mock_ontap"
 	"github.com/netapp/trident/storage"
 	sa "github.com/netapp/trident/storage_attribute"
 	"github.com/netapp/trident/utils"
-
-	log "github.com/sirupsen/logrus"
-	"github.com/stretchr/testify/assert"
 
 	tridentconfig "github.com/netapp/trident/config"
 	drivers "github.com/netapp/trident/storage_drivers"
@@ -750,7 +750,7 @@ func TestDriverValidate(t *testing.T) {
 	assert.Nil(t, sanEcoDriver.validate(ctx), "San Economy driver validation failed")
 }
 
-func TestDriverValidateInvalidDataLIF(t *testing.T) {
+func TestDriverIgnoresDataLIF(t *testing.T) {
 	vserverAdminHost := ONTAPTEST_LOCALHOST
 	vserverAdminPort := "0"
 	vserverAggrName := ONTAPTEST_VSERVER_AGGR_NAME
@@ -763,7 +763,7 @@ func TestDriverValidateInvalidDataLIF(t *testing.T) {
 	sanEcoDriver := newTestOntapSanEcoDriver(vserverAdminHost, vserverAdminPort, vserverAggrName, false, mockAPI)
 	sanEcoDriver.Config.DataLIF = "foo"
 
-	assert.EqualError(t, sanEcoDriver.validate(ctx), "error driver validation failed: data LIF is not a valid IP: foo")
+	assert.NoError(t, sanEcoDriver.validate(ctx), "driver validation succeeded: data LIF is ignored")
 }
 
 func TestDriverValidateInvalidPrefix(t *testing.T) {

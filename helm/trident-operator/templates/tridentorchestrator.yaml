@@ -4,6 +4,7 @@ metadata:
   name: trident
 spec:
   namespace: {{ .Release.Namespace }}
+  enableForceDetach: {{ include "trident.enableForceDetach" $ }}
   debug: {{ include "trident.debug" $ }}
   IPv6: {{ include "trident.IPv6" $ }}
   k8sTimeout: {{ .Values.tridentK8sTimeout }}
@@ -12,6 +13,7 @@ spec:
   autosupportImage: {{ include "trident.autosupportImage" $ }}
   autosupportProxy: {{ .Values.tridentAutosupportProxy }}
   logFormat: {{ include "trident.logFormat" $ }}
+  disableAuditLog: {{ include "trident.disableAuditLog" $ }}
   probePort: {{ include "trident.probePort" $ }}
   tridentImage: {{ include "trident.image" $ }}
   {{- if .Values.imageRegistry }}
@@ -50,4 +52,5 @@ spec:
       {{- end}}
     {{- end}}
   {{- end }}
+  imagePullPolicy: {{ include "imagePullPolicy" $ }}
   windows: {{ .Values.windows }}
