@@ -5,12 +5,14 @@ It's recommended to first compare this repository vs. NetApp's and build it from
 tldr;
 
 ```sh
+# clone the repo with custom YAML setup files
 git clone https://github.com/scaleoutsean/trident -b v23.01-arm64
 cd trident; mkdir bin # to save tridentctl
-wget https://github.com/scaleoutsean/trident/releases/download/v23.01-arm64/tridentctl -O ./bin/tridentctl
+wget https://github.com/scaleoutsean/trident/releases/download/v23.01/tridentctl -O ./bin/tridentctl
 chmod +x ./bin/tridentctl
 # use scaleoutsean's container from Docker Hub
 ./bin/tridentctl install -n trident --use-custom-yaml --trident-image docker.io/scaleoutsean/trident-arm64:v23.01
+# if you get a permission error, try to prefix that with "sudo "
 ```
 
 ## Build it yourself on ARM64 system with Docker-CE
@@ -20,13 +22,16 @@ See the official Trident documentation (including BUILD.md) for more. My source 
 ```sh
 git clone https://github.com/scaleoutsean/trident -b v23.01-arm64
 cd trident
-sudo GOOS=linux GOARCH=arm64 make trident_build
+GOOS=linux GOARCH=arm64 make trident_build
+# prefix with "sudo " if necessary
 ```
 
 See BUILD.md for other options. Then view your work:
 
 ```sh
 docker images
+ls ./bin
+# should have trident_operator in addition to tridentctl downloaded earlier
 ```
 
 Verify that Trident container has been built - you should see your Trident build, golang and an ARM64 base container:
@@ -76,6 +81,7 @@ If you wish to install to the namespace `trident`:
   - setup/trident-deployment.yaml
   - Image locations in daemonset and deployment YAML were changed from the NetApp Trident (x86_64) defaults to `scaleoutsean/trident-arm64:v23.01` (Docker Hub) for people who don't want to build their own or don't want to RTFM
   - Autosupport (ASUP) was removed as mentioned earlier
+  - trident-operator string is replaced with trident-
 - Run `tridentctl install -n trident --use-custom-yaml` to deploy Trident to the Trident namespace. Add `sudo` in front and `--trident-image ${LOCATION}` at the end if you need that. If you're using my Docker Hub image, those will install by default. Otherwise try `tridentctl install --help` to see how to use own images (local or from private container registry).
 
 ```sh
@@ -107,3 +113,42 @@ $ sudo ./tridentctl version -n trident --client
 Users who use Helm, Trident Operator, etc. should check the official docs. I don't use that stuff.
 
 Version v23.01 contains some Windows stuff. I haven't tried to use that as I don't have Windows on ARM64, so unless you want to try to install Trident on Windows ARM64 clients or something like that, better use the official repo for Windows-related experimentation.
+
+## Next steps
+
+Just follow the official docs at this point - configure your client, pick a protocol/back-end, etc.
+
+In my case I have a Debian client and a SolidFire VM running on ESXi v7:
+
+```sh
+$ cat /etc/debian_version 
+11.6
+$ uname -a
+Linux k1 6.1.7-meson64 #22.11.4 SMP PREEMPT Mon Jan 23 21:25:00 UTC 2023 aarch64 GNU/Linux
+```
+
+Modified trident-installer/sample-input/backends-samples$ cat solidfire/backend-solidfire.json, with a SolidFire storage account `k3s`:
+
+```json
+{
+    "version": 1,
+    "storageDriverName": "solidfire-san",
+    "Endpoint": "https://admin:****@192.168.105.32/json-rpc/11.0",
+    "SVIP": "192.168.1.32:3260",
+    "TenantName": "k3s",
+    "Types": [{"Type": "Bronze", "Qos": {"minIOPS": 100, "maxIOPS": 2000, "burstIOPS": 400}},
+              {"Type": "Silver", "Qos": {"minIOPS": 400, "maxIOPS": 6000, "burstIOPS": 800}},
+              {"Type": "Gold", "Qos": {"minIOPS": 600, "maxIOPS": 8000, "burstIOPS": 1000}}]
+}
+```
+
+Create a back-end in the Trident namespace.
+
+```sh
+$ ./bin/tridentctl -n trident create backend -n trident -f trident-installer/sample-input/backends-samples/solidfire/backend-solidfire.json 
++------------------------+----------------+--------------------------------------+--------+---------+
+|          NAME          | STORAGE DRIVER |                 UUID                 | STATE  | VOLUMES |
++------------------------+----------------+--------------------------------------+--------+---------+
+| solidfire_192.168.1.32 | solidfire-san  | 62eda961-bdac-4298-a2c6-27282e627427 | online |       0 |
++------------------------+----------------+--------------------------------------+--------+---------+
+```
