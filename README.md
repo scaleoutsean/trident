@@ -123,11 +123,16 @@ In my case I have a Debian client and a SolidFire VM running on ESXi v7:
 ```sh
 $ cat /etc/debian_version 
 11.6
+
 $ uname -a
 Linux k1 6.1.7-meson64 #22.11.4 SMP PREEMPT Mon Jan 23 21:25:00 UTC 2023 aarch64 GNU/Linux
+
+$ sudo kubectl get nodes
+NAME   STATUS   ROLES                  AGE    VERSION
+k1     Ready    control-plane,master   129d   v1.24.4+k3s1
 ```
 
-Modified trident-installer/sample-input/backends-samples$ cat solidfire/backend-solidfire.json, with a SolidFire storage account `k3s`:
+Modified ./trident-installer/sample-input/backends-samples/solidfire/backend-solidfire.json configured it with a SolidFire storage account `k3s`:
 
 ```json
 {
