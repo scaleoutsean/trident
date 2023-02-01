@@ -145,7 +145,7 @@ Modified trident-installer/sample-input/backends-samples$ cat solidfire/backend-
 Create a back-end in the Trident namespace.
 
 ```sh
-$ ./bin/tridentctl -n trident create backend -n trident -f trident-installer/sample-input/backends-samples/solidfire/backend-solidfire.json 
+$ ./bin/tridentctl -n trident create backend -f trident-installer/sample-input/backends-samples/solidfire/backend-solidfire.json
 +------------------------+----------------+--------------------------------------+--------+---------+
 |          NAME          | STORAGE DRIVER |                 UUID                 | STATE  | VOLUMES |
 +------------------------+----------------+--------------------------------------+--------+---------+
