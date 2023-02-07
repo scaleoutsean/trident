@@ -141,9 +141,9 @@ Modified ./trident-installer/sample-input/backends-samples/solidfire/backend-sol
     "Endpoint": "https://admin:****@192.168.105.32/json-rpc/11.0",
     "SVIP": "192.168.1.32:3260",
     "TenantName": "k3s",
-    "Types": [{"Type": "Bronze", "Qos": {"minIOPS": 100, "maxIOPS": 2000, "burstIOPS": 400}},
-              {"Type": "Silver", "Qos": {"minIOPS": 400, "maxIOPS": 6000, "burstIOPS": 800}},
-              {"Type": "Gold", "Qos": {"minIOPS": 600, "maxIOPS": 8000, "burstIOPS": 1000}}]
+    "Types": [{"Type": "Bronze", "Qos": {"minIOPS": 100, "maxIOPS": 200, "burstIOPS": 400}},
+              {"Type": "Silver", "Qos": {"minIOPS": 400, "maxIOPS": 600, "burstIOPS": 800}},
+              {"Type": "Gold", "Qos": {"minIOPS": 600, "maxIOPS": 800, "burstIOPS": 1000}}]
 }
 ```
 
