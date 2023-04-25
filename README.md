@@ -1,3 +1,9 @@
+## Official ARM64 builds
+
+Starting with v23.04, NetApp Trident supports ARM64, so please use upstream repository for v23.04 and future releases.
+
+Below you can find instructions for v23.01 and some earlier releases.
+
 ## Install w/o building it yourself
 
 It's recommended to first compare this repository vs. NetApp's and build it from source, but if you don't have the resources you are welcome to try my Docker Hub builds.
